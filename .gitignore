@@ -1,0 +1,19 @@
+# the model and what setup writes
+models/
+data/
+config/
+logs/
+.venv/
+# builds and packages
+build/
+build-*/
+bin/
+dist/
+__pycache__/
+*.pyc
+# measurement results
+bench/data/
+bench/logs/
+bench/nsys/
+bench/quality_runs/
+bench/*.csv

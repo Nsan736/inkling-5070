@@ -1,0 +1,44 @@
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 601361acd..de06d3c19 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -475,7 +475,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+     auto tim2 = std::chrono::high_resolution_clock::now();
+     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+ 
+-    if (int(tokens.size()) < 2*n_ctx) {
++    // inkling-mini-strata (local): LLAMA_PPL_TAIL=N keeps the logits of a chunk's last N positions only (a long
++    // context's tail as the reference), in place of its second half
++    const char * tail_env = getenv("LLAMA_PPL_TAIL");
++    const int ppl_tail = tail_env ? atoi(tail_env) : 0;
++    if (int(tokens.size()) < (ppl_tail > 0 ? n_ctx : 2*n_ctx)) {
+         LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
+                 n_ctx);
+         LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
+@@ -509,7 +513,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+ 
+     std::vector<float> logits;
+     if (num_batches > 1) {
+-        logits.reserve(size_t(n_ctx) * n_vocab);
++        logits.reserve(size_t(ppl_tail > 0 ? ppl_tail + 1 : n_ctx) * n_vocab);
+     }
+ 
+     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
+@@ -522,7 +526,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
+         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
+         const int nv = 2*((n_vocab + 1)/2) + 4;
+-        log_probs.resize(size_t(n_ctx) * nv);
++        log_probs.resize(size_t(ppl_tail > 0 ? ppl_tail + 1 : n_ctx) * nv);
+     }
+ 
+     // We get the logits for all the tokens in the context window (params.n_ctx)
+@@ -537,7 +541,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+     // Example, we have a context window of 512, we will compute perplexity for each of the
+     // last 256 tokens.  Then, we split the input up into context window size chunks to
+     // process the entire prompt.
+-    const int first = n_ctx/2;
++    const int first = ppl_tail > 0 ? n_ctx - 1 - ppl_tail : n_ctx/2;
+ 
+     for (int i = 0; i < n_chunk; i += n_seq) {
+         const int start =     i * n_ctx;

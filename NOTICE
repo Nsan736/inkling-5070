@@ -1,0 +1,63 @@
+inkling2-mini
+=============
+
+This project runs Thinking Machines' Inkling 2 Mini on one NVIDIA GPU plus system RAM.
+It contains, or is built from, the following components.
+
+Source code in this repository
+------------------------------
+
+- Strata (https://github.com/Niko1221/Strata), MIT License,
+  Copyright (c) 2026 Niko1221 and the Strata contributors.
+  The engine's base (engine/base, engine/include, engine/kernels) and the expert cache come from it
+  through PolyStrata.
+
+- PolyStrata (https://github.com/simplexai-labs/PolyStrata), pull request #200 "poly: Inkling 2 Mini",
+  head commit 6e610541f344fee87f17f7c50da4bf2fc72a997c, MIT License,
+  Copyright (c) 2026 Niko1221 and the Strata contributors, Copyright (c) 2026 VecSzn and the
+  PolyStrata contributors (engine/LICENSE.PolyStrata, server/LICENSE.PolyStrata).
+  - engine/: the strata-poly engine cut down to Inkling 2 (engine/UPSTREAM.md lists every file).
+  - server/serve, server/tools/strata_tokenizer.py, server/tools/gguf_reader.py: the OpenAI- and
+    Anthropic-compatible server and the tokenizer, unchanged except that the server also recognizes
+    this engine's name (strata-inkling2).
+
+- Strata pull request #6506 (ik2), MIT License, Copyright (c) 2026 Peasant Smith, OscarSheng,
+  alesha-pro, cobra91 and the Project Maya contributors: engine/dspark.cu and engine/dspark.hpp
+  (the optional DSpark drafter) are ported from its engine/src/ik2/ik2_draft.cu and ik2_kernels.cu.
+
+- llama.cpp / ggml (https://github.com/ggml-org/llama.cpp) at 3cf03257f219afbe7334045ff7c6a06ac68c627d,
+  MIT License, Copyright (c) 2023-2026 The ggml authors: third_party/llama.cpp/ggml (ggml-base and
+  ggml-cpu for the CPU experts, and ggml-cuda's MMQ kernels for reading prompts). The licenses of
+  the code it vendors are in third_party/llama.cpp/licenses.
+
+- tools/dev/llamacpp_ppl_tail.patch is a change to llama.cpp's tools/perplexity/perplexity.cpp
+  (MIT, The ggml authors) used only to make reference logits for the quality checks.
+
+Everything else (the changes listed in UPSTREAM.md, scripts/, tools/, bench/, docs/) is this project's,
+under the MIT License in LICENSE.
+
+Files in the Windows release package
+------------------------------------
+
+- cublas64_13.dll and cublasLt64_13.dll: NVIDIA CUDA Toolkit 13.3, redistributed under the NVIDIA
+  CUDA Toolkit End User License Agreement (Attachment A, redistributable files); the agreement is
+  licenses/CUDA-EULA.txt in the package. The CUDA runtime is linked statically.
+- msvcp140*.dll and vcruntime140*.dll: the Microsoft Visual C++ runtime, redistributable files of
+  Visual Studio.
+
+The model
+---------
+
+The model is not included; setup.bat downloads it from Hugging Face.
+
+- Inkling 2 Mini by Thinking Machines (https://huggingface.co/thinkingmachines/Inkling-2-Mini),
+  Apache License 2.0.
+- The GGUF file used, Inkling-2-Mini-UD-IQ4_XS.gguf, is Unsloth's quantization
+  (https://huggingface.co/unsloth/Inkling-2-Mini-GGUF, revision
+  45fd08764f2b0bf16b03a5483a80e5c7aaec8772), Apache License 2.0.
+
+Compared, not included
+----------------------
+
+- NInfer (https://github.com/iamwavecut/ninfer-all, Apache License 2.0) was measured beside this engine
+  (docs/ninfer_comparison.md); none of its code is in this repository.
