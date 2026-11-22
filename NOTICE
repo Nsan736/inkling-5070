@@ -1,5 +1,5 @@
-inkling2-mini
-=============
+inkling-5070
+============
 
 This project runs Thinking Machines' Inkling 2 Mini on one NVIDIA GPU plus system RAM.
 It contains, or is built from, the following components.

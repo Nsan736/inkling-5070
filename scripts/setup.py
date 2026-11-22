@@ -103,7 +103,7 @@ def download(dst: Path):
     part = dst.with_suffix(dst.suffix + ".part")
     have = part.stat().st_size if part.exists() else 0
     say(f"Downloading {MODEL_FILE} ({MODEL_SIZE / 1e9:.1f} GB) from huggingface.co/{MODEL_REPO}")
-    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "inkling2-mini-setup"})
+    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "inkling-5070-setup"})
     if have:
         req.add_header("Range", f"bytes={have}-")
         say(f"  resuming at {have / 1e9:.1f} GB")

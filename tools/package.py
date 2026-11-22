@@ -26,7 +26,7 @@ EXES = ("strata-inkling2.exe", "inkling2_logits_dump.exe")
 CUDA_DLLS = ("cublas64_13.dll", "cublasLt64_13.dll")
 CRT_DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll",
             "vcruntime140_1.dll")
-TREE = ("server", "scripts", "docs", "setup.bat", "run.bat", "requirements.txt", "README.md", "README.ja.md", "LICENSE",
+TREE = ("server", "scripts", "docs", "setup.bat", "run.bat", "requirements.txt", "README.md", "README.en.md", "LICENSE",
         "NOTICE", "UPSTREAM.md")
 
 
@@ -58,7 +58,7 @@ def main():
     for e in EXES:
         if not (bin_src / e).exists():
             sys.exit(f"{bin_src / e} is missing: run tools\\build.bat first")
-    name = f"inkling2-mini-{a.version}-windows-x64-cuda13"
+    name = f"inkling-5070-{a.version}-windows-x64-cuda13"
     stage = ROOT / "dist" / name
     if stage.exists():
         shutil.rmtree(stage)
