@@ -1,6 +1,7 @@
 // src/poly/kernels_inkling.cu - Inkling 2 Mini's kernels; see include/strata/poly/inkling_kernels.hpp for the math
 // and where it comes from.  Plain float arithmetic throughout, the caches' halves (or Q8_0 codes) the only rounding,
 // but for the prompt batches' attention on the tensor cores (attn_mma_kernel), whose products take halves.
+#include <cstdlib>
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -943,6 +944,32 @@ __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint
 #endif
 }
 
+// inkling2 fork: the same step summing halves (INKLING2_ATTN_F16): c two half2, rows gid and gid + 8
+__device__ __forceinline__ void mma16816_h(uint32_t* c, const uint32_t* a, const uint32_t* b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a[2]), "r"(a[3]), "r"(b[1]));
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+// c (as mma16816's floats) += the half2 sums h
+__device__ __forceinline__ void add_halves(float* c, const uint32_t* h) {
+    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+    c[0] += lo.x;
+    c[1] += lo.y;
+    c[2] += hi.x;
+    c[3] += hi.y;
+}
+
 __device__ __forceinline__ void ldmatrix_x4(uint32_t* r, const half* p, bool trans) {
     const unsigned a = (unsigned) __cvta_generic_to_shared(p);
     if (trans)
@@ -976,7 +1003,9 @@ static_assert(16 * MMA_WARPS / AT_PER * AT_PER >= 16 * MMA_WARPS - 2, "attn_mma_
 // MMA_BIAS distances, put in shared memory as floats and read back at each score's distance.  Only the tiles
 // that hold a distance below the extent compute it.  The tiles are counted from position 0, so a row's sums do
 // not depend on the other rows of the block.  The sink is added at the end, as one more weight of no value.
-template <bool KQ8, bool VQ8>
+// inkling2 fork, F16 (INKLING2_ATTN_F16, opt-in): 1 sums a tile's P V in halves (the tiles' sums in floats, as
+// before), 2 Q K^T too (a score's 128 products in halves).
+template <bool KQ8, bool VQ8, int F16 = 0>
 __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) {
 #if INKLING_MMA
     __shared__ __align__(16) half ks[MMA_KEYS][MMA_KROW], vs[MMA_KEYS][MMA_KROW];
@@ -1056,12 +1085,19 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
         float s[MMA_KEYS / 8][4];
         for (int n = 0; n < MMA_KEYS / 8; ++n) {
             s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+            uint32_t sh[2] = {0u, 0u};
             for (int k = 0; k < 8; k += 2) {
                 uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
                 ldmatrix_x4(b, &ks[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
-                mma16816(s[n], qa[k], b);
-                mma16816(s[n], qa[k + 1], b + 2);
+                if constexpr (F16 >= 2) {
+                    mma16816_h(sh, qa[k], b);
+                    mma16816_h(sh, qa[k + 1], b + 2);
+                } else {
+                    mma16816(s[n], qa[k], b);
+                    mma16816(s[n], qa[k + 1], b + 2);
+                }
             }
+            if constexpr (F16 >= 2) add_halves(s[n], sh);
         }
         if (near) {
             // the warp's rows times its distances: column e is distance p0 + wt0 - (k0 + MMA_KEYS - 1) + e
@@ -1106,6 +1142,9 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
                     l[i] += s[n][j];
                 }
         }
+        uint32_t oh[16][2];
+        if constexpr (F16 >= 1)
+            for (int n = 0; n < 16; ++n) oh[n][0] = oh[n][1] = 0u;
         for (int k = 0; k < MMA_KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
             const uint32_t pa[4] = {half2_bits(s[2 * k][0], s[2 * k][1]), half2_bits(s[2 * k][2], s[2 * k][3]),
                                     half2_bits(s[2 * k + 1][0], s[2 * k + 1][1]),
@@ -1113,10 +1152,17 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
             for (int n = 0; n < 16; n += 2) {
                 uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
                 ldmatrix_x4(b, &vs[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
-                mma16816(o[n], pa, b);
-                mma16816(o[n + 1], pa, b + 2);
+                if constexpr (F16 >= 1) {
+                    mma16816_h(oh[n], pa, b);
+                    mma16816_h(oh[n + 1], pa, b + 2);
+                } else {
+                    mma16816(o[n], pa, b);
+                    mma16816(o[n + 1], pa, b + 2);
+                }
             }
         }
+        if constexpr (F16 >= 1)
+            for (int n = 0; n < 16; ++n) add_halves(o[n], oh[n]);
     }
     for (int i = 0; i < 2; ++i) {
         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
@@ -1945,7 +1991,22 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     if (at) throw std::invalid_argument("inkling_attend: the position on the card takes the split path and a room");
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
         const dim3 gm(grid(rows, MMA_TOKENS), kv_heads);
-        if (kq && vq) attn_mma_kernel<true, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        // inkling2 fork: INKLING2_ATTN_F16=1 or 2 (attn_mma_kernel's F16), off by default
+        static const int f16 = [] {
+            const char* v = std::getenv("INKLING2_ATTN_F16");
+            return v ? std::atoi(v) : 0;
+        }();
+        if (f16 >= 2) {
+            if (kq && vq) attn_mma_kernel<true, true, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else if (kq) attn_mma_kernel<true, false, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else if (vq) attn_mma_kernel<false, true, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else attn_mma_kernel<false, false, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        } else if (f16 == 1) {
+            if (kq && vq) attn_mma_kernel<true, true, 1><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else if (kq) attn_mma_kernel<true, false, 1><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else if (vq) attn_mma_kernel<false, true, 1><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else attn_mma_kernel<false, false, 1><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        } else if (kq && vq) attn_mma_kernel<true, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         else if (kq) attn_mma_kernel<true, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         else if (vq) attn_mma_kernel<false, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         else attn_mma_kernel<false, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);

@@ -1245,14 +1245,16 @@ int serve(Session& ss) {
             const double per = r.produced > 0 ? 1.0 / (double) r.produced : 0.0;   // the answer's tokens
             std::fprintf(stderr, "strata-inkling2: expert cache %d experts (%d when full, %.2f GiB) at %lld tokens, "
                                  "%lld MiB VRAM free; per written token: %.2f ms, CPU experts %.2f ms, router wait "
-                                 "%.2f ms, %.1f CPU experts (%.1f MB, %.1f GB/s while in them)\n",
+                                 "%.2f ms, %.1f CPU experts (%.1f MB, %.1f GB/s while in them), %.2f left out, hit rate %.1f%%\n",
                          engine.cached_experts(), engine.full_experts(), engine.cached_gib(), (long long) engine.pos(),
                          (long long) engine.vram_free_mib(), r.decode_ms * per, (now.cpu_ms - before.cpu_ms) * per,
                          (now.route_wait_ms - before.route_wait_ms) * per, (double) misses * per,
                          (double) (now.cpu_bytes - before.cpu_bytes) * per / 1e6,
                          now.cpu_ms > before.cpu_ms
                              ? (double) (now.cpu_bytes - before.cpu_bytes) / ((now.cpu_ms - before.cpu_ms) * 1e6)
-                             : 0.0);
+                             : 0.0,
+                         (double) (now.tail_experts - before.tail_experts) * per,
+                         hits + misses > 0 ? 100.0 * (double) hits / (double) (hits + misses) : 100.0);
             // INKLING2_TIMELINE=1: the written tokens' visits, per token
             engine.tl_settle();
             const strata::poly::Stats& tl = engine.stats();
@@ -1687,6 +1689,8 @@ int main(int argc, char** argv) {
         else if (a == "--ram-experts-mib") o.ram_experts_mib = std::atoll(val());
         else if (a == "--tail-skip") o.tail_skip = std::atoi(val());
         else if (a == "--skip-weight") o.skip_weight = (float) std::atof(val());
+        else if (a == "--skip-renorm") o.skip_renorm = true;
+        else if (a == "--skip-in-prompt") o.skip_in_prompt = true;
         else if (a == "--cache-bias") o.cache_bias = (float) std::atof(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());

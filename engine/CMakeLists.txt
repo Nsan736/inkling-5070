@@ -29,8 +29,10 @@ if(MSVC)
 endif()
 
 set(INK_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-set(INK_INCLUDE ${INK_DIR}/include)
 set(INK_ENGINE_ROOT ${INK_DIR}/../..)
+# inkling2 fork: zstd's decoder (BSD), for the manifests of .strata files (include/strata/sq/sq_reader.hpp)
+set(INK_ZSTD_ROOT ${INK_ENGINE_ROOT}/third_party/zstd-dec CACHE PATH "zstd's decoder sources")
+set(INK_INCLUDE ${INK_DIR}/include ${INK_ZSTD_ROOT})
 set(INK_GGML_ROOT ${INK_ENGINE_ROOT}/third_party/strata-llama CACHE PATH "llama.cpp tree to take ggml from")
 set(INK_GG ${INK_GGML_ROOT}/ggml)
 set(INK_MMQ ${INK_GG}/src/ggml-cuda)
@@ -64,6 +66,14 @@ if(MSVC)
   list(APPEND INK_CUDA_OPTS $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
 endif()
 
+add_library(ink_zstd STATIC
+  ${INK_ZSTD_ROOT}/common/debug.c ${INK_ZSTD_ROOT}/common/entropy_common.c ${INK_ZSTD_ROOT}/common/error_private.c
+  ${INK_ZSTD_ROOT}/common/fse_decompress.c ${INK_ZSTD_ROOT}/common/xxhash.c ${INK_ZSTD_ROOT}/common/zstd_common.c
+  ${INK_ZSTD_ROOT}/decompress/huf_decompress.c ${INK_ZSTD_ROOT}/decompress/zstd_ddict.c
+  ${INK_ZSTD_ROOT}/decompress/zstd_decompress.c ${INK_ZSTD_ROOT}/decompress/zstd_decompress_block.c)
+target_include_directories(ink_zstd PUBLIC ${INK_ZSTD_ROOT})
+target_compile_definitions(ink_zstd PRIVATE ZSTD_DISABLE_ASM=1)
+
 # ---- ink_core: device, pinned memory, graphs, files, conversation files, drafting helpers ----
 add_library(ink_core STATIC
   base/core/device.cu base/core/pinned.cu base/core/graph.cpp base/core/weights.cpp base/core/layout.cpp
@@ -72,7 +82,7 @@ add_library(ink_core STATIC
   base/spec/suffix_drafter.cpp base/spec/controller.cpp base/spec/draft_policy.cpp base/spec/draft_source.cpp
   base/kernels/ngram.cpp base/ngram/ple_reader.cpp)
 target_include_directories(ink_core PUBLIC ${INK_INCLUDE} ${CUDAToolkit_INCLUDE_DIRS})
-target_link_libraries(ink_core PUBLIC CUDA::cudart)
+target_link_libraries(ink_core PUBLIC CUDA::cudart ink_zstd)
 
 # ---- ink_kernels: the quantized products and the small kernels (one .cu each) ----
 set(INK_KERNELS
@@ -109,18 +119,24 @@ target_compile_options(ink_mmq PRIVATE ${INK_CUDA_OPTS})
 target_compile_definitions(ink_mmq PRIVATE STRATA_POLY_NVFP4=1)
 target_link_libraries(ink_mmq PUBLIC ggml-base CUDA::cudart)
 
+# inkling2 fork: Strata's sm_120a SF4 prompt kernels (W4A4, INKLING2_SQ_W4A4, opt-in), the same 12xa archs
+add_library(ink_sq_fp4 STATIC strata_fp4/ink_moe_fp4_sm120.cu strata_fp4/sq_w4a4.cu)
+set_target_properties(ink_sq_fp4 PROPERTIES CUDA_ARCHITECTURES "${INK_FP4_ARCHS}")
+target_include_directories(ink_sq_fp4 PRIVATE strata_fp4 ${INK_INCLUDE} ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_options(ink_sq_fp4 PRIVATE ${INK_CUDA_OPTS})
+
 # ---- ink_cpu: the routed experts on the CPU (ggml-cpu dot products) ----
-add_library(ink_cpu STATIC cpu_experts.cpp cpu_lowbit.cpp)
+add_library(ink_cpu STATIC cpu_experts.cpp cpu_lowbit.cpp sq/cpu_sq.cpp)
 target_include_directories(ink_cpu PUBLIC ${INK_GG}/include ${INK_INCLUDE})
 set_source_files_properties(cpu_lowbit.cpp PROPERTIES INCLUDE_DIRECTORIES ${INK_GG}/src)
 target_link_libraries(ink_cpu PUBLIC ggml-cpu ggml-base Threads::Threads)
 if(MSVC)   # cpu_nvfp4.hpp's AVX2 / AVX-VNNI / F16C (the experts run on this PC's CPU)
-  set_source_files_properties(cpu_experts.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+  set_source_files_properties(cpu_experts.cpp sq/cpu_sq.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
 endif()
 
 # ---- the engine ----
-set(INK_ENGINE_SOURCES engine.cpp inkling.cpp spill.cpp kernels.cu kernels_inkling.cu dspark.cu)
-set(INK_LIBS ink_mmq ink_cpu ink_kernels ink_core CUDA::cublas CUDA::cudart CUDA::cuda_driver)
+set(INK_ENGINE_SOURCES engine.cpp inkling.cpp spill.cpp kernels.cu kernels_inkling.cu dspark.cu kernels_sq.cu)
+set(INK_LIBS ink_sq_fp4 ink_mmq ink_cpu ink_kernels ink_core CUDA::cublas CUDA::cudart CUDA::cuda_driver)
 
 # the engine's own sources are compiled once and shared by both programs
 add_library(ink_engine OBJECT ${INK_ENGINE_SOURCES})

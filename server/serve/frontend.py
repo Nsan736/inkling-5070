@@ -1934,12 +1934,14 @@ class InklingParser:
     think_open = INK_HEADER + INK_THINK
     think_end = INK_END
 
-    def __init__(self, tools: list[dict] | None = None, stream_tools: bool = False, **_):
+    def __init__(self, tools: list[dict] | None = None, stream_tools: bool = False, text_opened: bool = False, **_):
         # (OutputParser's other options - thinking, recover, call_format, opened - change nothing for these blocks)
+        # text_opened (inkling2 fork): the prompt ends with a text block's opening (thinking off), so the reply
+        # starts inside that block
         self.schemas = {t.get("name"): t for t in tools or []}
         self.stream_tools = stream_tools
         self.buf = ""
-        self.mode = "between"            # between | head | thinking | text | call
+        self.mode = "text" if text_opened else "between"   # between | head | thinking | text | call
         self.name = None                 # the call block's tool name
         self.scall = None                # the call announced by tool_start
         self.pending: list = []          # (OutputParser's calls from the reasoning: none here)

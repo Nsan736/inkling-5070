@@ -64,7 +64,9 @@ RESTORE_TIMEOUT = 900.0     # 数 GB の保存ファイルを復元する上限 
 
 
 def session_path(kv, text="docs"):
-    return DATA / f"long_120k_{kv}{'' if text == 'docs' else '_' + text}.session"
+    # a model other than the default IQ4_XS (--model) keeps its own saved states
+    tag = "" if MODEL.name == "Inkling-2-Mini-UD-IQ4_XS.gguf" else "_" + MODEL.stem.replace("Inkling-2-Mini-", "").lower()
+    return DATA / f"long_120k_{kv}{'' if text == 'docs' else '_' + text}{tag}.session"
 
 
 def load_info():
@@ -296,15 +298,21 @@ def main():
                     help="DSpark ドラフター (INKLING2_DSPARK, models/official/mtp.safetensors) で推測デコード。--window 8。"
                          "CSV の decode 欄が mtp (lookup と併用なら mtp+lookup)。128K は保存した状態を使わず全部読む")
     ap.add_argument("--temp", type=float, default=0.0, help="生成の温度 (0: greedy)")
-    ap.add_argument("--text", choices=["docs", "code"], default="docs",
-                    help="128K の文脈: docs (llama.cpp の文書) か code (このフォークの engine/src とコードを書く指示)")
+    ap.add_argument("--text", choices=["docs", "code", "code64", "code256"], default="docs",
+                    help="128K の文脈: docs (llama.cpp の文書) か code (このフォークの engine/src とコードを書く指示)。"
+                         "code64: code の最初の 56K (64K の文脈)。code256: code の後に docs を続けた約 245K "
+                         "(--extra \"--max-context 263168\" と使う)")
     ap.add_argument("--no-full", action="store_true", help="--long で 128K の全読み (prefill_full) を省く")
+    ap.add_argument("--model", default="", help="別のモデルのファイル (例: SQ-10 の .strata)。既定は IQ4_XS の GGUF")
     ap.add_argument("--quick", action="store_true",
                     help="生成の比較だけ: 素・温度 1.0 を --reps 回 (greedy / lookup / 読み込みの計測 / 128K の全読みなし。"
                          "--long は保存した状態を 1 回復元して後ろの 8K を読み、続けて生成する)")
+    ap.add_argument("--prefill8k", action="store_true", help="--quick (8K) で 8K の読み込みも --reps 回測る")
     ap.add_argument("--window", type=int, default=0, help="推測の窓 (下書き長 + 1)。--mtp / --lookup と使う")
     a = ap.parse_args()
-    global SAMPLING
+    global SAMPLING, MODEL
+    if a.model:
+        MODEL = pathlib.Path(a.model)
     if a.temp > 0:
         SAMPLING = f"temperature={a.temp} top_k=0 top_p=1 min_p=0 seed=1234"
     if a.mtp:
@@ -337,8 +345,9 @@ def main():
     if not info["warmed"]:
         # 読み込み直後の 1 回目は遅い (エキスパートのキャッシュが温まっていない) ので数えない
         run_gen(c, gen_prompt)
-        run_prefill(c, ids("prefill_8k.ids"), nonce)
-        nonce += 1
+        if not a.quick:   # --quick measures writing only: its warm-up reads no 8K prompt
+            run_prefill(c, ids("prefill_8k.ids"), nonce)
+            nonce += 1
         c.send("@WARMED")
         c.read_until(("@OK",), 10)
         print(f"ウォームアップ済み ({time.time() - t_start:.1f} 秒)")
@@ -349,7 +358,7 @@ def main():
     tele = telemetry.Telemetry(info["pid"]).start()
     if a.quick:
         if a.long:
-            pre = "long_code" if a.text == "code" else "long"
+            pre = {"code": "long_code", "code256": "long_code256", "code64": "long_code64"}.get(a.text, "long")
             base, tail = ids(f"{pre}_base.ids"), ids(f"{pre}_tail.ids")
             if not session_120k.exists():
                 raise RuntimeError(f"{session_120k} がない: --quick なしで 1 回作る")
@@ -364,6 +373,12 @@ def main():
             pres.append(1000.0 * done["read"] / done["prompt_ms"])
         else:
             mode, context_at, n_pre, prompt = "short", 0, 0, gen_prompt
+            if a.prefill8k:   # the 8K prompt's read too, --reps times (a new first token each: nothing reused)
+                n_pre = 8192
+                for _ in range(a.reps):
+                    tps, _ = run_prefill(c, ids("prefill_8k.ids"), nonce)
+                    nonce += 1
+                    pres.append(tps)
         for _ in range(a.reps):
             tps1, d1 = run_gen(c, prompt, sampling=T1)
             gens_t1.append(tps1)
@@ -386,7 +401,7 @@ def main():
             nonce += 1
             pres.append(tps)
     else:
-        pre = "long_code" if a.text == "code" else "long"
+        pre = {"code": "long_code", "code256": "long_code256", "code64": "long_code64"}.get(a.text, "long")
         mode, base, tail = "long", ids(f"{pre}_base.ids"), ids(f"{pre}_tail.ids")
         context_at, n_pre = len(base), len(tail)
         if a.mtp:   # the drafter's context needs the taps of every position: the whole 128K is read

@@ -9,4 +9,5 @@ endif()
 project(inkling_5070 LANGUAGES C CXX CUDA)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(INK_GGML_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp CACHE PATH "llama.cpp tree to take ggml from")
+set(INK_ZSTD_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd-dec)   # zstd's decoder (BSD), for the .strata reader
 add_subdirectory(engine)

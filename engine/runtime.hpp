@@ -148,6 +148,8 @@ public:
     }
 
     const MetaValue* get(const std::string& key) const { return files_[0]->get(key); }
+    /// inkling2 fork: a .strata model's experts, or null for a GGUF
+    const sq::Parsed* strata() const { return files_[0]->strata(); }
     const std::vector<std::string>& paths() const { return paths_; }
     const TensorInfo* find(const std::string& name) const {
         const auto it = where_.find(name);
@@ -162,8 +164,7 @@ public:
                 out.emplace_back(nullptr, 0);
                 continue;
             }
-            const TensorInfo& t = f->tensors()[0];
-            out.emplace_back(f->tensor_data(t) - f->data_start() - t.offset, (size_t) f->file_size());
+            out.emplace_back(f->base(), (size_t) f->file_size());
         }
         return out;
     }

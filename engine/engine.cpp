@@ -1,6 +1,7 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
+#include "sq/cpu_sq.hpp"
 #include "stage_copy.hpp"
 
 #if !defined(STRATA_GPU_METAL)
@@ -362,6 +363,10 @@ void drop_images() {
 // Experts [e0, e1) of L in the mapped file, to f(start, bytes): their gates and ups (one span where the file keeps
 // an expert's two in one tensor), and their downs.
 template <class F> void expert_bytes(const Layer& L, int e0, int e1, F&& f) {
+    if (L.sq()) {   // inkling2 fork: a .strata layer's experts, each one body
+        for (int e = e0; e < e1; ++e) f(L.sq_ex[e].body, (size_t) L.sq_ex[e].bytes);
+        return;
+    }
     const size_t n = (size_t) (e1 - e0);
     f(L.exp_gate + (size_t) e0 * L.gu_stride, n * L.gu_stride);
     if (L.gu_stride == L.gu_bytes) f(L.exp_up + (size_t) e0 * L.u_stride, n * L.u_stride);
@@ -1440,6 +1445,15 @@ void Engine::shrink_cache(size_t bytes) {
     fill_now();
     ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
     const size_t ne = (size_t) n_expert_, end = cut > kTail ? cut - kTail : 0;   // kTail stays past the last slot
+    if (gg_->strata()) {   // inkling2 fork: slots of their experts' own sizes
+        shrink_sq_cache(end);
+        ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
+        vmm_unmap(arena_, cut);
+        if (cut > kTail) zero_vram(exp_ + end, kTail);
+        exp_at_ = std::min(exp_at_, end);
+        staged_il_ = -1;
+        return;
+    }
     struct Held {
         float recent;
         int64_t prior;
@@ -1488,6 +1502,214 @@ void Engine::shrink_cache(size_t bytes) {
     if (cut > kTail) zero_vram(exp_ + end, kTail);
     exp_at_ = std::min(exp_at_, end);
     staged_il_ = -1;
+}
+
+// inkling2 fork: a .strata cache cut at `end`: each expert past it, the most used first, takes the slot of a less
+// used one before the cut whose slot holds it (the slots are of their first experts' sizes), else leaves the cache.
+void Engine::shrink_sq_cache(size_t end) {
+    struct Held {
+        double value;
+        int il, e;
+    };
+    const auto value = [&](int il, int e) {
+        const size_t i = (size_t) il * n_expert_ + (size_t) e;
+        return (double) (recent_.empty() ? 0.f : recent_[i]) * 1e9 + (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
+    };
+    std::vector<Held> past, low;
+    for (int il = 0; il < (int) layers_.size(); ++il) {
+        const Layer& L = layers_[(size_t) il];
+        if (!L.sq()) continue;
+        for (int e = 0; e < n_expert_; ++e) {
+            const uint8_t* s = L.slot[(size_t) e];
+            if (!s) continue;
+            if ((size_t) (s - exp_) + L.sq_cap[(size_t) e] > end) past.push_back({value(il, e), il, e});
+            else low.push_back({value(il, e), il, e});
+        }
+    }
+    std::sort(past.begin(), past.end(), [](const Held& a, const Held& b) { return a.value > b.value; });
+    std::sort(low.begin(), low.end(), [](const Held& a, const Held& b) { return a.value < b.value; });
+    std::vector<bool> used(low.size(), false);
+    for (const Held& x : past) {
+        Layer& L = layers_[(size_t) x.il];
+        const size_t need = L.sq_ex[x.e].bytes;
+        uint8_t*& from = L.slot[(size_t) x.e];
+        for (size_t k = 0; k < low.size(); ++k) {
+            if (used[k] || low[k].value >= x.value) {
+                if (low[k].value >= x.value) break;
+                continue;
+            }
+            Layer& M = layers_[(size_t) low[k].il];
+            if (M.sq_cap[(size_t) low[k].e] < need + kTail) continue;
+            uint8_t*& to = M.slot[(size_t) low[k].e];
+            ck(cudaMemcpyAsync(to, from, need, cudaMemcpyDeviceToDevice, cs(st_)), "the expert cache");
+            // the slot keeps its size; it is now this expert's
+            L.sq_cap[(size_t) x.e] = M.sq_cap[(size_t) low[k].e];
+            from = to;
+            to = nullptr;
+            used[k] = true;
+            --cached_;   // the one it replaced leaves the cache
+            goto moved;
+        }
+        from = nullptr;
+        --cached_;
+    moved:;
+    }
+}
+
+// inkling2 fork: a prompt batch of a .strata layer on the card, by Strata's tensor-core kernels (sq_rows_round()).
+// The experts outside VRAM go through sq_stage_ a round at a time (as many as it holds), and each round takes the
+// batch's tokens kSqRowsMax at a time: their h and pairs' outputs sit where the batch's gate, up and h rows do
+// (g_ to h_).  Each round adds its experts' outputs into fo_.  False when it cannot (the caller computes them).
+bool Engine::moe_sq_rows(Layer& L, int il, int n) {
+    const size_t ne = (size_t) n_expert_, e_row = (size_t) n_embd_;
+    const int used = n_used_;
+    const size_t ff = (size_t) rows_ * std::max({n_ff_, n_ff_shexp_, 2 * n_ff_exp_});
+    // h's Q8_1_G64 blocks go in q8_ (alloc()'s size): 18 of 80 bytes a pair
+    const int q_max = std::max({n_embd_, n_ff_, n_ff_shexp_, n_ff_exp_, widest(), 256});
+    const size_t q8_cap = (size_t) rows_ * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256);
+    if (sq_w4a4_ < 0) {   // INKLING2_SQ_W4A4=1: the SF4 experts with FP4 activations (opt-in)
+        const char* v = std::getenv("INKLING2_SQ_W4A4");
+        sq_w4a4_ = v && std::atoi(v) > 0 && sq_w4a4_available() ? 1 : 0;
+    }
+    // hq's 1440 bytes a pair, and with W4A4 ha's 864 after them
+    const size_t per_pair = (size_t) (kSqFf / 64) * kSqG64Bytes + (sq_w4a4_ > 0 ? 864 : 0);
+    const int rmax = std::min({n, sq_rows_max_, (int) (q8_cap / ((size_t) used * per_pair))});
+    if (!sq_stage_ || used != 8 || h_ != u_ + ff || u_ != g_ + ff || n_embd_ != kSqEmbd || n_ff_exp_ != kSqFf)
+        return false;
+    // the routing, on the host's threads
+    sq_ids_.resize((size_t) n * used);
+    sq_w_.resize((size_t) n * used);
+    const int parts = std::min(workers_->threads(), (n + 63) / 64);
+    workers_->run(parts, [&](int p) {
+        float* tmp = route_tmp_.data() + (size_t) p * 2 * ne;
+        const int end = (int) ((int64_t) n * (p + 1) / parts);
+        for (int t = (int) ((int64_t) n * p / parts); t < end; ++t)
+            route(il, h_rl_ + (size_t) t * ne, tok_ ? tok_[t] : -1, sq_ids_.data() + (size_t) t * used,
+                  sq_w_.data() + (size_t) t * used, tmp);
+    });
+    std::vector<int> count(ne, 0);
+    for (int32_t e : sq_ids_) {
+        ++count[(size_t) e];
+        ++use_[(size_t) il * ne + (size_t) e];
+    }
+    // the rounds: the cached experts and the first of the others that sq_stage_ holds, then the rest
+    std::vector<int> round_of(ne, -1);
+    std::vector<std::vector<int>> staged(1);
+    std::vector<size_t> at_of(ne, 0);
+    size_t at = 0;
+    for (size_t e = 0; e < ne; ++e) {
+        if (!count[e]) continue;
+        if (L.slot[e]) {
+            round_of[e] = 0;
+            continue;
+        }
+        const size_t b = ((size_t) L.sq_ex[e].bytes + 255) / 256 * 256;
+        if (at + b > sq_stage_bytes_) {
+            staged.emplace_back();
+            at = 0;
+        }
+        round_of[e] = (int) staged.size() - 1;
+        at_of[e] = at;
+        staged.back().push_back((int) e);
+        at += b;
+    }
+    stats_.gpu_experts += (int64_t) n * used;
+    const size_t cap_p = (size_t) 2 * rows_;   // the pairs of kSqRowsMax tokens that g_ to h_ hold
+    float* hbuf = g_;
+    float* ybuf = u_;
+    for (int r = 0; r < (int) staged.size(); ++r) {
+        if (!staged[(size_t) r].empty()) {   // the bodies through pinned memory (the copy before is done with it)
+            ck(cudaEventSynchronize((cudaEvent_t) ev_sq_stage_), "SQ staging");
+            const std::vector<int>& sr = staged[(size_t) r];
+            workers_->run((int) sr.size(), [&](int j) {
+                const sq::Expert& x = L.sq_ex[(size_t) sr[(size_t) j]];
+                std::memcpy(h_sq_stage_ + at_of[(size_t) sr[(size_t) j]], x.body, x.bytes);
+            });
+            const int last = sr.back();
+            const size_t bytes = at_of[(size_t) last] + L.sq_ex[(size_t) last].bytes;
+            ck(cudaMemcpyAsync(sq_stage_, h_sq_stage_, bytes, cudaMemcpyHostToDevice, cs(st_)), "SQ staging");
+            ck(cudaEventRecord((cudaEvent_t) ev_sq_stage_, cs(st_)), "SQ staging");
+            stats_.batch_staged += (int64_t) sr.size();
+        }
+        for (int a0 = 0; a0 < n; a0 += rmax) {
+            const int m = std::min(rmax, n - a0), P = m * used;
+            // the tables of this round and these tokens, in pinned memory of their own turn
+            sq_turn_ ^= 1;
+            ck(cudaEventSynchronize((cudaEvent_t) ev_sq_tab_[sq_turn_]), "SQ tables");
+            int32_t* hb = (int32_t*) h_sq_tab_[sq_turn_];
+            int32_t *cnt = hb, *off = cnt + 128, *active = off + 129, *nact = active + 128, *ntl = nact + 1;
+            int32_t* pairs = ntl + 2;   // 8-byte rows from here (tiles, ex)
+            int32_t* tok = pairs + cap_p;
+            int32_t* ids = tok + cap_p;
+            float* w = (float*) (ids + cap_p);
+            int32_t* tiles = (int32_t*) (w + cap_p);   // int2
+            auto* ex = (SqTcExpert*) (tiles + 2 * (cap_p / 16 + 128));
+            std::fill(cnt, cnt + 128, 0);
+            for (int i = 0; i < P; ++i) ++cnt[sq_ids_[(size_t) a0 * used + (size_t) i]];
+            int o = 0, na = 0, nt = 0;
+            unsigned kinds = 0;
+            bool pure_sf4 = true;   // no expert of SF4 gate|up with another down (W4A4 takes both or neither)
+            for (int e = 0; e < 128; ++e) {
+                off[e] = o;
+                const sq::Expert& x = L.sq_ex[(size_t) e];
+                const bool in = cnt[e] > 0 && round_of[(size_t) e] == r;
+                ex[e].body = (uint64_t) (uintptr_t) (L.slot[(size_t) e] ? L.slot[(size_t) e] : sq_stage_ + at_of[(size_t) e]);
+                ex[e].dn_off = x.dn_off;
+                ex[e].gu = (uint8_t) x.gu;
+                ex[e].dn = (uint8_t) x.dn;
+                ex[e].tier = in ? 0 : 2;
+                if (cnt[e] > 0) active[na++] = e;
+                if (in) {
+                    for (int q = 0; q < cnt[e]; q += 16) {
+                        tiles[2 * nt] = e;
+                        tiles[2 * nt + 1] = o + q;
+                        ++nt;
+                    }
+                    kinds |= x.gu == sq::SF4 ? kSqTcGuSf4 : kSqTcGuSk;
+                    pure_sf4 = pure_sf4 && (x.gu == sq::SF4) == (x.dn == sq::SF4);
+                    kinds |= x.dn == sq::SF4 ? kSqTcDnSf4 : kSqTcDnSk;
+                }
+                o += cnt[e];
+            }
+            off[128] = o;
+            *nact = na;
+            *ntl = nt;
+            std::vector<int> fill(128, 0);
+            for (int i = 0; i < P; ++i) {
+                const int e = sq_ids_[(size_t) a0 * used + (size_t) i];
+                const int pos = off[e] + fill[(size_t) e]++;
+                pairs[pos] = i;
+                tok[pos] = i / used;
+                ids[i] = e;
+                w[i] = sq_w_[(size_t) a0 * used + (size_t) i];
+            }
+            if (nt == 0) continue;
+            const size_t tab_bytes = (size_t) ((uint8_t*) (ex + 128) - (uint8_t*) hb);
+            ck(cudaMemcpyAsync(sq_tab_, hb, tab_bytes, cudaMemcpyHostToDevice, cs(st_)), "SQ tables");
+            ck(cudaEventRecord((cudaEvent_t) ev_sq_tab_[sq_turn_], cs(st_)), "SQ tables");
+            const auto dev = [&](const void* p) { return (int32_t*) ((uint8_t*) sq_tab_ + ((const uint8_t*) p - (const uint8_t*) hb)); };
+            SqTcTables t;
+            t.experts = dev(ex);
+            t.cnt = dev(cnt);
+            t.off = dev(off);
+            t.active = dev(active);
+            t.nact = dev(nact);
+            t.n_tiles = dev(ntl);
+            t.pairs = dev(pairs);
+            t.tok_idx = dev(tok);
+            t.tiles = dev(tiles);
+            t.w = (const float*) dev(w);
+            if (sq_w4a4_ > 0 && (kinds & kSqTcGuSf4) && pure_sf4) {   // xa behind x's Q8_1_G64 blocks in xq_
+                uint8_t* xa = (uint8_t*) xq_ + ((size_t) m * (kSqEmbd / 64) * kSqG64Bytes + 255) / 256 * 256;
+                uint8_t* ha = (uint8_t*) q8_ + (size_t) P * (kSqFf / 64) * kSqG64Bytes;
+                sq_rows_w4a4(t, nt, xn_ + (size_t) a0 * e_row, m, xa, ha, ybuf, st_);
+                kinds &= ~(kSqTcGuSf4 | kSqTcDnSf4);
+            }
+            sq_rows_round(t, nt, kinds, xn_ + (size_t) a0 * e_row, m, xq_, hbuf, q8_, P, ybuf, st_);
+            sq_rows_add(ybuf, dev(ids), t.experts, fo_ + (size_t) a0 * e_row, m, used, st_);
+        }
+    }
+    return true;
 }
 
 float* Engine::fbuf(size_t n) {
@@ -1599,6 +1821,15 @@ void Engine::load_moe(int il, bool shared, int from, bool any_type_scales) {
     auto mat = [&](const char* n, int64_t a, int64_t b) { return upload(tensor(src, n), blk(src, n), a, b, kAnyMat); };
     L.moe = true;
     L.gate_inp = mat("ffn_gate_inp.weight", n_embd_, n_expert_);
+    if (const sq::Parsed* sp = gg_->strata()) {   // inkling2 fork: a .strata file's experts (none shared)
+        if (shared) throw std::runtime_error("a .strata model with shared experts is not taken");
+        if (n_ff_exp_ != sp->n_ff || n_embd_ != sp->n_embd || n_expert_ != sp->n_expert)
+            throw std::runtime_error("the .strata file's experts are not this model's shape");
+        L.sq_ex = sp->experts.data() + (size_t) src * (size_t) n_expert_;
+        L.slot.assign((size_t) n_expert_, nullptr);
+        ++n_moe_;
+        return;
+    }
     if (shared) {
         L.sh_gate = mat("ffn_gate_shexp.weight", n_embd_, n_ff_shexp_);
         L.sh_up = mat("ffn_up_shexp.weight", n_embd_, n_ff_shexp_);
@@ -1819,6 +2050,13 @@ Dev Engine::upload(const TensorInfo* t, const std::string& name, int64_t n_in, i
                    float (*fix)(float)) {
     Dev d = upload_as(t, name, n_in, n_out, want, fix);
     d.scale = global_scale(*t);
+    // inkling2 fork: a .strata Q8_ROW matrix's row scales, "<name>.rscale" for "<name>.weight"
+    static const std::string w = ".weight";
+    if (t && t->name.size() > w.size() && t->name.compare(t->name.size() - w.size(), w.size(), w) == 0)
+        if (const TensorInfo* rs = home(*t).find(t->name.substr(0, t->name.size() - w.size()) + ".rscale")) {
+            const Dev r = upload_as(rs, name + ".rscale", n_out, 1, kF32, nullptr);
+            d.rscale = (const float*) r.p;
+        }
     return d;
 }
 
@@ -1877,7 +2115,8 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
         return d;
     }
     const bool as_is = !fix && (t->type == kTypeF32 || (want != kF32 && t->type == kTypeBF16) ||
-                                (want == kAnyMat && kernels::native_mmvq_supported((int) t->type)));
+                                (want == kAnyMat && (kernels::native_mmvq_supported((int) t->type) ||
+                                                     sq::is_sq_type(t->type))));   // inkling2 fork: S_K
     const uint32_t type = as_is ? t->type : want == kF32 ? kTypeF32 : kTypeBF16;
     const size_t out = as_is ? bytes : count * (type == kTypeF32 ? sizeof(float) : sizeof(uint16_t));
     if (type == kTypeBF16) bf16_max_ = std::max(bf16_max_, count);
@@ -1994,8 +2233,40 @@ void Engine::fill_expert_cache() {
     std::vector<Cand> cands;
     std::vector<size_t> sizes;   // the slot sizes there are; a layer's place among them is its trade number
     size_t all = 0;
+    // inkling2 fork (after kuraneko1/Strata, MIT): the order of the experts no token has used yet, opt-in
+    // (INKLING2_ZERO_ORDER).  index (the default): the experts' index, so each layer gets its share.  loop: by how many
+    // times a token runs its layer (Inkling 2's loop, layers 6 to 17, three times), the loop's experts first.
+    // weighted: by visits / (1 + index), a loop layer about three times a single one's share.  Only the order among
+    // the unused changes (a share of 1e-9, below any use).  Measured on the first 400 tokens after a start (RTX 5070,
+    // IQ4_XS): index 64-67 tok/s from token 101, loop 60 (the single layers' experts all on the CPU).
+    std::vector<int> visits(layers_.size(), 0);
+    for (int il = 0; il < (int) layers_.size(); ++il)
+        if (routed(layers_[(size_t) il])) ++visits[(size_t) home_of(il)];
+    static const int zero_order = [] {
+        const char* v = std::getenv("INKLING2_ZERO_ORDER");
+        return !v ? 0 : std::string(v) == "loop" ? 1 : std::string(v) == "weighted" ? 2 : 0;
+    }();
     for (int il = 0; il < (int) layers_.size(); ++il) {
         Layer& L = layers_[(size_t) il];
+        if (L.moe && L.sq()) {   // inkling2 fork: a .strata layer, each expert's body in a slot of its own size
+            const sq::Parsed& sp = *gg_->strata();
+            L.trade = -1;   // no slot of it is traded (no swaps, no cuts)
+            for (int e = 0; e < n_expert_; ++e) {
+                const size_t i = (size_t) il * n_expert_ + e;
+                const size_t bytes = ((size_t) L.sq_ex[e].bytes + kTail + 255) / 256 * 256;
+                L.slot_bytes = std::max(L.slot_bytes, bytes);
+                slot_max_ = std::max(slot_max_, bytes);
+                double used = (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
+                if (used == 0 && !sp.load_order.empty()) {   // the file's order: the loop's layers first
+                    const auto at = std::find(sp.load_order.begin(), sp.load_order.end(),
+                                              (uint16_t) (il * n_expert_ + e));
+                    used = 1e-6 * (double) (sp.load_order.end() - at);
+                }
+                cands.push_back({il, e, bytes, used / (double) bytes});
+                all += bytes;
+            }
+            continue;
+        }
         if (!L.moe || !kernels::native_mmvq_supported((int) L.gu_type) ||
             !kernels::native_mmvq_supported((int) L.u_type) || !kernels::native_mmvq_supported((int) L.d_type))
             continue;
@@ -2013,7 +2284,9 @@ void Engine::fill_expert_cache() {
         slot_max_ = std::max(slot_max_, bytes);
         for (int e = 0; e < n_expert_; ++e) {
             const size_t i = (size_t) il * n_expert_ + e;
-            const double used = (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
+            double used = (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
+            if (used == 0 && zero_order == 1) used = 1e-9 * visits[(size_t) il];
+            if (used == 0 && zero_order == 2) used = 1e-9 * visits[(size_t) il] / (1.0 + e);
             cands.push_back({il, e, bytes, used / (double) bytes});
             all += bytes;
         }
@@ -2106,6 +2379,14 @@ void Engine::fill_expert_cache() {
         uint8_t* s = exp_ + exp_at_;
         exp_at_ += c.bytes;
         const size_t e = (size_t) c.e;
+        if (L.sq()) {   // inkling2 fork: the body as it is
+            h2d(s, L.sq_ex[e].body, L.sq_ex[e].bytes);
+            L.slot[e] = s;
+            if (L.sq_cap.size() != (size_t) n_expert_) L.sq_cap.assign((size_t) n_expert_, 0);
+            L.sq_cap[e] = c.bytes;
+            ++cached_;
+            continue;
+        }
         const uint8_t* g_src = L.exp_gate + e * L.gu_stride;
         const uint8_t* u_src = L.exp_up + e * L.u_stride;
         const uint8_t* d_src = L.exp_down + e * L.d_bytes;
@@ -2150,7 +2431,7 @@ void Engine::fill_expert_cache() {
 }
 
 void Engine::ensure_stage() {
-    if (!mmq_ || stage_) return;
+    if (!mmq_experts_ || stage_) return;
 #if defined(STRATA_GPU_METAL)
     if (opt_.metal_balanced && all_cached()) return;
 #endif
@@ -2816,6 +3097,11 @@ void Engine::load_layers(const Options& o) {
         std::fprintf(stderr, "strata-poly: STRATA_POLY_STREAM_STAGE: %s\n",
                      stream_stage_ ? "streaming CPU stores for expert staging" : "unsupported CPU build; stock copies");
     gg_ = std::make_unique<Shards>(opt_.model);
+    if (gg_->strata()) {
+        // inkling2 fork: a .strata model's expert cache is filled at the load, each expert in a slot of its own
+        // size, which the online swaps do not handle yet; the attention caches' growth cuts it (shrink_sq_cache())
+        opt_.expert_swaps = 0;
+    }
     if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
 #if defined(STRATA_GPU_METAL)
     if (opt_.kv_format == KvFmt::kAuto) {
@@ -2917,6 +3203,8 @@ void Engine::load_layers(const Options& o) {
     tok_row_ = gg_->payload(*te) / (size_t) n_vocab_;
     tok_type_ = te->type;
     tok_embd_ = gg_->data(*te);
+    if (const TensorInfo* rs = gg_->find("token_embd.rscale"))   // inkling2 fork: a .strata token table
+        tok_rscale_ = (const float*) gg_->data(*rs);
 
     // twice: the first pass adds up the arena, the second fills it
     for (int pass = 0; pass < 2; ++pass) {
@@ -3026,6 +3314,7 @@ void Engine::load_experts() {
     // mapping, experts that do not fit are read back a fault at a time: on the lab's machine held to 12 GB, Qwen3.6
     // UD-Q3_K_M wrote 51, 73 and 99 tokens/s (a chat, after a 24,000-token prompt, a chat again) with every expert
     // mapped and 61, 88 and 120 with a budget of 6 GiB.
+    if (gg_->strata()) opt_.ram_experts_mib = -1;   // inkling2 fork: a .strata file's experts through the mapping
     if (opt_.ram_experts_mib < -1) {
         constexpr size_t kRamHeadroom = size_t(4) << 30;
         const size_t avail = ram_available();
@@ -3230,9 +3519,11 @@ void Engine::shared_scratch() {
     if (rows_ >= kStageRows && bf16_max_ > 0) wf_ = fbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
     if (mmq_) {
         const size_t rr = n * n_used_;
-        gu_ = fbuf(rr * 2 * n_ff_exp_);
-        hx_ = fbuf(rr * n_ff_exp_);
-        dx_ = fbuf(rr * n_embd_);
+        if (mmq_experts_) {
+            gu_ = fbuf(rr * 2 * n_ff_exp_);
+            hx_ = fbuf(rr * n_ff_exp_);
+            dx_ = fbuf(rr * n_embd_);
+        }
         hf_ = fbuf(rr);
     }
 }
@@ -3300,12 +3591,16 @@ void Engine::alloc() {
         const bool gu_fits = L.mixed() ? Mmq::fits((int) L.gu_type, n_ff_exp_, n_embd_, lb) &&
                                              Mmq::fits((int) L.u_type, n_ff_exp_, n_embd_, lb)
                                        : Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_, lb);
-        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, lb);
+        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, lb) &&
+                !L.sq();   // inkling2 fork: a .strata layer's prompt batches go through moe() (SQ kernels)
         tiles = tiles || L.mmq;
         mixed_tiles = mixed_tiles || (L.mmq && L.mixed());
         one_expert = std::max(one_expert, L.gu_step + L.d_bytes);
     }
-    if (tiles) mmq_ = std::make_unique<Mmq>();
+    // inkling2 fork: a .strata model's prompt batches multiply its trunk (Q8_0 and the like) by MMQ too, without
+    // the routed experts' buffers (mmq_experts_: a layer's experts by MMQ)
+    mmq_experts_ = tiles;
+    if (tiles || (gg_->strata() && rows_ >= kStageRows)) mmq_ = std::make_unique<Mmq>();
     if (mmq_ && reserve_mmq_) mmq_->reserve_fixup();
 
     shared_scratch();   // the first pass only counts
@@ -3327,8 +3622,35 @@ void Engine::alloc() {
     h_x_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
     h_cpu_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
     h_logits_ = (float*) hmalloc((size_t) n_vocab_ * sizeof(float), "pinned memory");
+    if (gg_->strata() && rows_ >= kSqRowsMin) {
+        // inkling2 fork: a .strata model's prompt batches (moe_sq_rows()): its staging buffer for the experts outside
+        // VRAM (INKLING2_SQ_STAGE_MIB, 0: none, its prompts' experts as its answers'), and the tables of a launch
+        const char* sm = std::getenv("INKLING2_SQ_STAGE_MIB");
+        const int mib = sm ? std::atoi(sm) : 64;   // 64: SQ-10 and SQ-15 read and write no slower than with 160
+        size_t biggest = 0;
+        for (const sq::Expert& x : gg_->strata()->experts) biggest = std::max(biggest, (size_t) x.bytes);
+        if (mib > 0) {
+            sq_stage_bytes_ = std::max((size_t) mib << 20, (biggest + 255) / 256 * 256);
+            sq_stage_ = (uint8_t*) dmalloc(sq_stage_bytes_, "the SQ staging buffer");
+            h_sq_stage_ = (uint8_t*) hmalloc(sq_stage_bytes_, "pinned memory");
+            sq_rows_max_ = rows_ / 4;   // their pairs' h and outputs fill g_ to h_ (moe_sq_rows())
+            const size_t cap_p = (size_t) 2 * rows_;
+            const size_t tab = (size_t) (128 + 129 + 128 + 3) * 4 + cap_p * 16 + (cap_p / 16 + 128) * 8 + 128 * 16;
+            sq_tab_ = dmalloc(tab, "scratch");
+            for (int b = 0; b < 2; ++b) {
+                h_sq_tab_[b] = hmalloc(tab, "pinned memory");
+                cudaEvent_t ev;
+                ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+                ev_sq_tab_[b] = ev;
+            }
+            cudaEvent_t ev;
+            ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+            ev_sq_stage_ = ev;
+        }
+    }
 
-    if (mmq_) {
+    if (mmq_ && !mmq_experts_) mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max), "scratch");
+    if (mmq_experts_) {
         const size_t rr = n * n_used_,
                      tab = (3 * rr + 3 * (size_t) n_expert_ + 3 + kClasses * ((size_t) n_expert_ + 1) +
                             2 * kMaxStagedTiles * (2 * (size_t) n_expert_ + 2)) * sizeof(int32_t);
@@ -3693,6 +4015,8 @@ void Engine::embed(int32_t token, float* dst) const {
     const uint8_t* row = tok_embd_ + (size_t) token * tok_row_;
     if (tok_type_ == kTypeF32) std::memcpy(dst, row, (size_t) n_embd_ * sizeof(float));
     else ggml_get_type_traits((ggml_type) tok_type_)->to_float(row, dst, n_embd_);
+    if (tok_rscale_)   // inkling2 fork: the row's scale (its blocks' are 1)
+        for (int i = 0; i < n_embd_; ++i) dst[i] *= tok_rscale_[token];
 }
 
 void Engine::images(const Image* im, int n) {
@@ -3743,6 +4067,7 @@ void Engine::dbg(const char* name, int il, const float* dev, int n) {
 void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
     lin_raw(w, x, y, n, xq, rows_per_x);
     if (w.scale != 1.0f) axpy(y, w.scale, y, n * w.n_out, false, st_);
+    if (w.rscale) mul_cols(y, w.rscale, w.n_out, n, st_);   // inkling2 fork: a .strata Q8_ROW matrix
 }
 
 void Engine::lin_jobs(const LinJob* jobs, int count, int n) {
@@ -3756,6 +4081,7 @@ void Engine::lin_jobs(const LinJob* jobs, int count, int n) {
     const auto launched = [&](int j) {
         const LinJob& g = jobs[j];
         if (g.w->scale != 1.0f) axpy(g.y, g.w->scale, g.y, n * g.w->n_out, false, st_);
+        if (g.w->rscale) mul_cols(g.y, g.w->rscale, g.w->n_out, n, st_);
         done[j] = grouped[j] = true;
     };
     // a token's matrices of several formats and one input width (a file of mixed quantizations): one launch
@@ -3808,6 +4134,10 @@ ExpertScales Engine::expert_scales(const Layer& L, const int32_t* ids) const {
 }
 
 void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
+    if (sq::is_sq_type(w.type)) {   // inkling2 fork: a .strata S_K matrix (the output of SQ-10 / SQ-15)
+        sq_gemv((int) (w.type - sq::kTypeBase), (const uint8_t*) w.p, x, y, w.n_in, w.n_out, n, st_);
+        return;
+    }
     if (w.type == kTypeF32 || w.type == kTypeBF16) {
         const int per = rows_per_x ? rows_per_x : w.n_out;
         const size_t count = (size_t) w.n_in * w.n_out;
@@ -4355,6 +4685,8 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         if (j < n_layer_) pool_ahead(home_of(j), n, part, prefetch_k_);
     }
 
+    // inkling2 fork: a prompt batch of a .strata layer, on the card (moe_sq_rows())
+    if (L.sq() && n >= kSqRowsMin && !block_pass_ && !first && moe_sq_rows(L, il, n)) return false;
     const float limit = clamp_exp_[(size_t) il];
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_);
     bool any_host = false;
@@ -4371,6 +4703,118 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         Cached cached[kCpuRows * kMaxUsed];
         int32_t host_e[kCpuRows * kMaxUsed], host_k[kCpuRows * kMaxUsed];   // a host entry's expert and its place
         float host_rel[kCpuRows * kMaxUsed];   // and its weight's share of its token's experts' weight
+        if (L.sq()) {   // inkling2 fork: a .strata layer's experts: the cached ones on the card, the others on the CPU
+            sq_host_.clear();
+            sq_card_.clear();
+            int64_t bytes = 0;
+            for (int t = 0; t < m; ++t) {
+                int ids[kMaxUsed];
+                float w[kMaxUsed];
+                route(il, h_rl_ + (size_t) (at + t) * n_expert_, tok_ ? tok_[at + t] : -1, ids, w, route_tmp_.data());
+                for (int k = 0; k < n_used_; ++k) {
+                    if (block_pass_ && w[k] == 0.f) continue;
+                    const size_t e = (size_t) ids[k];
+                    if (!block_pass_) {
+                        ++use_[(size_t) il * n_expert_ + e];
+                        if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
+                    }
+                    const sq::Expert& x = L.sq_ex[e];
+                    if (const uint8_t* s = L.slot[e]) {
+                        sq_card_.push_back({s, x.dn_off, x.gu, x.dn, w[k], t});
+                        continue;
+                    }
+                    sq_host_.push_back({x.body, x.dn_off, x.gu, x.dn, w[k], t});
+                    bytes += x.bytes;
+                }
+            }
+            stats_.gpu_experts += (int64_t) sq_card_.size();
+            stats_.cpu_experts += (int64_t) sq_host_.size();
+            stats_.cpu_bytes += bytes;
+            // the cached ones a code at a time (both codes of a pair: gate|up and down), kSqJobs to a launch, then
+            // into their tokens' rows of fo_ in the order they came, kSumRows at a time
+            const std::function<void()> card = [&] {
+                if (split_) cudaSetDevice(device_);
+                if (first && at == 0) (*first)();
+                const int nc = (int) sq_card_.size();
+                if (!sq_xq_) {   // the Q8_1_G64 blocks of a call's inputs and of a launch's activations
+                    sq_xq_ = dmalloc((size_t) kCpuRows * (kSqEmbd / 64) * kSqG64Bytes, "scratch");
+                    sq_hq_ = dmalloc((size_t) kSqJobs * (kSqFf / 64) * kSqG64Bytes, "scratch");
+                }
+                bool any_sk = false;
+                for (const SqCpuExpert& c : sq_card_) any_sk = any_sk || c.gu != sq::SF4;
+                if (any_sk) sq_quantize_g64(xn_ + (size_t) at * e_row, sq_xq_, m, n_embd_, st_);
+                std::vector<int> order((size_t) nc);
+                std::iota(order.begin(), order.end(), 0);
+                // the S_K ones together (one launch, each job its own codes), each pair of codes with SF4 apart
+                const auto key = [&](int i) {
+                    const SqCpuExpert& c = sq_card_[(size_t) i];
+                    return c.gu != sq::SF4 && c.dn != sq::SF4 ? 0 : c.gu * 256 + c.dn + 1;
+                };
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return key(a) < key(b); });
+                std::vector<int> place((size_t) nc);   // an entry's row of d_ (its place in order, within kSumRows)
+                for (int i0 = 0; i0 < nc;) {
+                    int i1 = i0;
+                    const int gu = sq_card_[(size_t) order[(size_t) i0]].gu, dn = sq_card_[(size_t) order[(size_t) i0]].dn;
+                    const int k0 = key(order[(size_t) i0]);
+                    while (i1 < nc && i1 - i0 < std::min(kSqJobs, kSumRows) && key(order[(size_t) i1]) == k0) ++i1;
+                    SqJobs jobs{};
+                    for (int i = i0; i < i1; ++i) {
+                        const SqCpuExpert& c = sq_card_[(size_t) order[(size_t) i]];
+                        jobs.body[i - i0] = c.body;
+                        jobs.dn_off[i - i0] = c.dn_off;
+                        jobs.row[i - i0] = c.row;
+                        jobs.gu[i - i0] = (uint8_t) c.gu;
+                        jobs.dn[i - i0] = (uint8_t) c.dn;
+                    }
+                    const float beta = situ_ ? situ_->beta : 4.f, lb = situ_ ? situ_->lin_beta : 25.f;
+                    static const bool sf4_float = std::getenv("INKLING2_SQ_SF4_FLOAT") != nullptr;
+                    if (gu == sq::SF4 && dn == sq::SF4 && !sf4_float) {
+                        sq_experts_sf4_h(jobs, i1 - i0, xn_ + (size_t) at * e_row, e_row, h_, d_, e_row, st_);
+                    } else if (k0 == 0) {
+                        sq_experts_gu_dp_any(jobs, i1 - i0, sq_xq_, h_, st_);
+                        sq_quantize_g64(h_, sq_hq_, i1 - i0, n_ff_exp_, st_);
+                        sq_experts_dn_dp_any(jobs, i1 - i0, sq_hq_, d_, e_row, st_);
+                    } else if (gu == sq::SF4) sq_experts_gu(gu, jobs, i1 - i0, xn_ + (size_t) at * e_row, e_row, h_, beta, lb, st_);
+                    else sq_experts_gu_dp(gu, jobs, i1 - i0, sq_xq_, h_, st_);
+                    if (k0 == 0 || (gu == sq::SF4 && dn == sq::SF4 && !sf4_float)) {
+                    } else if (dn == sq::SF4) {
+                        sq_experts_dn(dn, jobs, i1 - i0, h_, d_, e_row, st_);
+                    } else {
+                        sq_quantize_g64(h_, sq_hq_, i1 - i0, n_ff_exp_, st_);
+                        sq_experts_dn_dp(dn, jobs, i1 - i0, sq_hq_, d_, e_row, st_);
+                    }
+                    // into fo_ in the entries' own order (a token's experts as the router gave them)
+                    ScaledRows sum{};
+                    int k = 0;
+                    std::vector<int> pos(i1 - i0);
+                    for (int i = i0; i < i1; ++i) pos[(size_t) (i - i0)] = order[(size_t) i];
+                    std::vector<int> by(pos);
+                    std::sort(by.begin(), by.end());
+                    for (int idx : by) {
+                        const int slot = (int) (std::find(pos.begin(), pos.end(), idx) - pos.begin());
+                        const SqCpuExpert& c = sq_card_[(size_t) idx];
+                        sum.x[k] = d_ + (size_t) slot * e_row;
+                        sum.acc[k] = fo_ + (size_t) (at + c.row) * e_row;
+                        sum.w[k] = c.weight;
+                        ++k;
+                    }
+                    if (k) add_scaled(sum, k, n_embd_, st_);
+                    i0 = i1;
+                }
+            };
+            if (sq_host_.empty()) {
+                card();
+                std::fill(h_cpu_ + (size_t) at * e_row, h_cpu_ + (size_t) (at + m) * e_row, 0.f);
+                continue;
+            }
+            any_host = true;
+            t0 = Clock::now();
+            const bool beside = !sq_card_.empty() || (first && at == 0);
+            cpu_experts_sq(*workers_, sq_host_.data(), (int) sq_host_.size(), m, h_x_ + (size_t) at * e_row,
+                           h_cpu_ + (size_t) at * e_row, beside ? &card : nullptr);
+            stats_.cpu_ms += ms_since(t0);
+            continue;
+        }
         int n_host = 0, n_cached = 0, n_split_card = 0;
         for (int t = 0; t < m; ++t) {
             int ids[kMaxUsed];
@@ -4425,24 +4869,42 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         // Options::skip_weight in place of the places: one whose weight is under that share of its token's experts'
         // weight, for every token here.  It keeps an expert the router weighs high at any place, and leaves out one it
         // weighs low at any place, so for the same change of the answers it leaves out more (docs/BACKENDS.md).
-        if (opt_.skip_weight > 0.f) {
+        // inkling2 fork: not in a prompt (Options::skip_in_prompt), and with Options::skip_renorm the kept experts of
+        // a token (in VRAM or not) take the left-out ones' share of its weight in proportion
+        const bool skip_now = !reading_ || opt_.skip_in_prompt;
+        float gone[kCpuRows] = {};   // a token's share of its experts' weight left out
+        if (skip_now && opt_.skip_weight > 0.f) {
             int kept = 0;
             for (int i = 0; i < n_host; ++i) {
                 bool low = true;
                 for (int j = 0; j < n_host && low; ++j) low = host_e[j] != host_e[i] || host_rel[j] < opt_.skip_weight;
-                if (low) ++stats_.tail_experts;
-                else host[kept++] = host[i];
+                if (low) {
+                    ++stats_.tail_experts;
+                    gone[host[i].row] += host_rel[i];
+                } else {
+                    host[kept++] = host[i];
+                }
             }
             n_host = kept;
-        } else if (opt_.tail_skip > 0) {
+        } else if (skip_now && opt_.tail_skip > 0) {
             int kept = 0;
             for (int i = 0; i < n_host; ++i) {
                 bool low = true;
                 for (int j = 0; j < n_host && low; ++j) low = host_e[j] != host_e[i] || host_k[j] >= opt_.tail_skip;
-                if (low) ++stats_.tail_experts;
-                else host[kept++] = host[i];
+                if (low) {
+                    ++stats_.tail_experts;
+                    gone[host[i].row] += host_rel[i];
+                } else {
+                    host[kept++] = host[i];
+                }
             }
             n_host = kept;
+        }
+        if (opt_.skip_renorm && !split) {
+            float f[kCpuRows];
+            for (int t = 0; t < m; ++t) f[t] = gone[t] > 0.f && gone[t] < 1.f ? 1.f / (1.f - gone[t]) : 1.f;
+            for (int i = 0; i < n_host; ++i) host[i].weight *= f[host[i].row];
+            for (int i = 0; i < n_cached; ++i) cached[i].w *= f[cached[i].row - at];
         }
         if (pool_) pool_take(L, il, host, n_host);
         stats_.gpu_experts += n_cached + n_split_card;
@@ -4640,7 +5102,7 @@ void Engine::sync_slots() {
 
 // inkling2 fork, INKLING2_CARD_SPLIT=1: whether moe() of n tokens at layer L routes them on the card (moe_split_launch())
 bool Engine::split_ok(const Layer& L, int n) const {
-    return card_split_ > 0 && split_slots_ && d_slots_ && !block_pass_ && n <= kCpuRows && n * n_used_ <= card_rows() &&
+    return card_split_ > 0 && split_slots_ && d_slots_ && !block_pass_ && !L.sq() && n <= kCpuRows && n * n_used_ <= card_rows() &&
            opt_.cache_bias <= 0.f && opt_.skip_weight <= 0.f && opt_.tail_skip <= 0 && !opt_.dump &&
            L.card != 0 && kernels::native_mmvq_ids_supported((int) L.gu_type) &&
            kernels::native_mmvq_ids_supported((int) L.u_type) && kernels::native_mmvq_ids_supported((int) L.d_type);
@@ -6171,6 +6633,11 @@ void Engine::layer(int il, int n) {
 bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                   const std::function<bool(int, int)>* turn) {
     if (n < 1 || n > read_rows_) throw std::logic_error("read takes 1 to max_read() tokens");
+    struct Reading {   // inkling2 fork: Options::skip_weight / tail_skip leave nothing out of a prompt
+        bool& b;
+        explicit Reading(bool& x) : b(x) { b = true; }
+        ~Reading() { b = false; }
+    } reading(reading_);
     for (const Image& im : images_)
         if (im.at < pos_ + n && im.at + im.n > pos_)
             throw std::logic_error("read takes no rows of a picture: eval() does, a picture a call");
@@ -6199,7 +6666,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         share = [&, to](int done, int of) { return (*asked)(lo_ * of + done * (to - lo_), n_layer_ * of); };
         return (const std::function<bool(int, int)>*) &share;
     };
-    if (n_calls == 1 || !mmq_ || all_cached() || n < opt_.stage_ahead) {
+    if (n_calls == 1 || !mmq_experts_ || all_cached() || n < opt_.stage_ahead) {
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
         // it.  Each card runs the calls as eval() does, in the same order.

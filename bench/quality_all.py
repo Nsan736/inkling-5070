@@ -7,8 +7,16 @@
         エキスパートは全部 CPU で、--no-op-offload (llama.cpp 690b87d は CPU に置いたエキスパートの重みを読み込み中に GPU へ
         写して計算する経路で、層 14 以降を CPU に置くと NaN になった。2K の参照 PPL 3.5162 に対しこの設定で 3.5187)
 
-構成は bench/data/quality_configs.json (名前、kv、環境変数、エンジンの設定)。q8_0 は比較のため必ず入れる
-(KV q4 などが不合格だったときに、同じ確認の q8_0 と並べて見られるように)。
+構成は bench/data/quality_configs.json (名前、kv、環境変数、エンジンの設定、model: 別のモデルのファイル、group: 順番)。
+q8_0 (既定の IQ4_XS) は比較のため必ず入れる (KV q4 などが不合格だったときに、同じ確認の q8_0 と並べて見られるように)。
+
+2K は 2 つの参照と照合する: llama.cpp の IQ4_XS (KV fp16、bench/data/ref_logits.bin) と、unsloth の Q8_K_XL
+(models/Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf がある場合。同じ文章・同じトークンで初回に作り
+bench/data/ref_q8_logits.bin に置く)。Q8 の方は量子化そのものの差も入るので、IQ4_XS / SQ-10 / SQ-15 を同じ物差しで並べる用。
+
+順番 (時間が足りないときに後ろが飛ぶ): 128K の参照、既定の 128K、Q8 の 2K 参照、各構成の 2K (group 順)、
+近似オプション (group "option") の 128K、SQ (group "sq") の 128K。--deadline HH:MM を付けると、目安の所要時間で
+その時刻に間に合わない手順は飛ばして記録する。
 
 判定
   2K    bench/data/quality_baseline.json から KLD 平均 2 倍以内、上位1一致の低下 0.5 ポイント以内
@@ -43,11 +51,13 @@ RUNS = ROOT / "bench" / "quality_runs"
 DUMP = bench.BUILD / "inkling2_logits_dump.exe"
 PPL = ROOT / "ref" / "llama.cpp" / "build" / "bin" / "llama-perplexity.exe"
 REF_MODEL = ROOT / "models" / "Mainline_Support" / "Inkling-2-Mini-UD-IQ4_XS.gguf"
+Q8_MODEL = ROOT / "models" / "Mainline_Support" / "Inkling-2-Mini-UD-Q8_K_XL.gguf"
+REF_Q8 = DATA / "ref_q8_logits.bin"
 CONFIGS = DATA / "quality_configs.json"
 TIMES = DATA / "quality_times.json"   # 前回までに測った手順ごとの所要時間 (目安に使う)
 TAIL = 1023                            # 照合する位置の数 (2K と同じ)
 VOCAB = 200058
-DEFAULT_TIMES = {"ref128k": 7200, "q2k": 120, "q128k": 420, "ref_smoke": 120, "q_smoke": 90}
+DEFAULT_TIMES = {"ref128k": 7200, "q2k": 120, "q128k": 420, "ref_smoke": 120, "q_smoke": 90, "ref2k_q8": 600}
 
 DEFAULT_CONFIGS = [
     {"name": "q8_0", "kv": "q8_0", "env": {}, "extra": [],
@@ -103,13 +113,26 @@ def configs():
     return cs
 
 
+def group(c):
+    return c.get("group", "base")
+
+
 def steps(cs, smoke):
-    """(key, kind, config or None) in order."""
-    out = [("ref_smoke" if smoke else "ref128k", "ref_smoke" if smoke else "ref128k", None)]
-    for c in cs:
-        if not smoke:
-            out.append((f"q2k:{c['name']}", "q2k", c))
-        out.append((f"{'q_smoke' if smoke else 'q128k'}:{c['name']}", "q_smoke" if smoke else "q128k", c))
+    """(key, kind, config or None) in order: the default's long check first, then every 2K, the options' long
+    checks, the SQ models' long checks (the later ones are the first to go when time runs out)."""
+    if smoke:
+        out = [("ref_smoke", "ref_smoke", None)]
+        return out + [(f"q_smoke:{c['name']}", "q_smoke", c) for c in cs]
+    out = [("ref128k", "ref128k", None)]
+    base = [c for c in cs if group(c) == "base"]
+    out += [(f"q128k:{c['name']}", "q128k", c) for c in base[:1]]
+    if Q8_MODEL.exists():
+        out.append(("ref2k_q8", "ref2k_q8", None))
+    order = {"base": 0, "sq": 1, "option": 2}
+    out += [(f"q2k:{c['name']}", "q2k", c) for c in sorted(cs, key=lambda c: order.get(group(c), 3))]
+    out += [(f"q128k:{c['name']}", "q128k", c) for c in base[1:]]
+    out += [(f"q128k:{c['name']}", "q128k", c) for c in cs if group(c) == "option"]
+    out += [(f"q128k:{c['name']}", "q128k", c) for c in cs if group(c) == "sq"]
     return out
 
 
@@ -140,13 +163,40 @@ def make_ref(run, smoke):
     src.write_text(ref_text(n_ctx * 6), encoding="utf-8")   # 1 トークン 3〜4 文字。余るぶんは使われない
     tmp = out.with_suffix(".part")
     env = dict(os.environ, LLAMA_PPL_TAIL=str(TAIL))
-    cmd = [str(PPL), "-m", str(REF_MODEL), "-f", str(src), "-c", str(n_ctx), "--chunks", "1", "-b", "2048",
+    # -ub 128: llama.cpp (690b87d) のこのモデルのアテンションは KQ を (ubatch x 文脈 x ヘッド) の行列で持つので、128K で
+    # 既定の 512 は 12 GB の計算バッファになり VRAM に入らない
+    cmd = [str(PPL), "-m", str(REF_MODEL), "-f", str(src), "-c", str(n_ctx), "--chunks", "1", "-b", "2048", "-ub", "128",
            "-ngl", "99", "--n-cpu-moe", "24", "--no-op-offload", "-t", str(bench.THREADS), "-fa", "on", "--kl-divergence-base", str(tmp)]
     run.log("llama.cpp で参照を作る: " + " ".join(cmd[1:]))
     with open(run.dir / "ref.log", "w", encoding="utf-8") as f:
         subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT, check=True, timeout=4 * 3600)
     tmp.replace(out)
     return {"path": str(out), "n_ctx": n_ctx}
+
+
+def make_ref_q8(run):
+    """Q8_K_XL の 2K 参照: ref_logits.bin と同じ文章 (ref_text_src.txt) の 2048 トークン 1 チャンク。トークンが
+    ref_logits.bin と同じことを確かめてから使う。"""
+    if REF_Q8.exists() and REF_Q8.stat().st_size > 1000:
+        run.log(f"Q8 の参照は作成済み: {REF_Q8}")
+    else:
+        tmp = REF_Q8.with_suffix(".part")
+        cmd = [str(PPL), "-m", str(Q8_MODEL), "-f", str(DATA / "ref_text_src.txt"), "-c", "2048", "--chunks", "1",
+               "-b", "2048", "-ngl", "99", "--n-cpu-moe", "24", "--no-op-offload", "-t", str(bench.THREADS), "-fa", "on",
+               "--kl-divergence-base", str(tmp)]
+        run.log("llama.cpp で Q8 の参照を作る: " + " ".join(cmd[1:]))
+        with open(run.dir / "ref_q8.log", "w", encoding="utf-8") as f:
+            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True, timeout=2 * 3600)
+        tmp.replace(REF_Q8)
+    toks = []
+    for ref in (DATA / "ref_logits.bin", REF_Q8):
+        out = run.dir / (ref.stem + ".tokens.txt")
+        subprocess.run([sys.executable, "-I", str(ROOT / "bench/compare_logits.py"), "--ref", str(ref),
+                        "--tokens-out", str(out)], check=True, capture_output=True)
+        toks.append(out.read_text().strip())
+    if toks[0] != toks[1]:
+        raise RuntimeError("Q8 の参照のトークンが IQ4_XS の参照と違う")
+    return {"path": str(REF_Q8), "n_ctx": 2048}
 
 
 def ref_tokens(ref):
@@ -157,10 +207,14 @@ def ref_tokens(ref):
     return [int(x) for x in tok.read_text().split(",")]
 
 
+def model_of(c):
+    return pathlib.Path(c["model"]) if c.get("model") else bench.MODEL
+
+
 def dump(run, c, prompt_file, decode, out_dir, max_context, timeout):
     env = dict(os.environ)
     env.update({k: str(v) for k, v in c.get("env", {}).items()})
-    cmd = [str(DUMP), str(bench.MODEL), "--tokens-file", str(prompt_file), "--decode", decode, "--vocab", str(VOCAB),
+    cmd = [str(DUMP), str(model_of(c)), "--tokens-file", str(prompt_file), "--decode", decode, "--vocab", str(VOCAB),
            "--out", str(out_dir), "--threads", str(bench.THREADS), "--kv", c["kv"], "--prompt-batch", "2048",
            "--ram-experts-mib", "9216", "--vram-reserve-mib", "400", "--max-context", str(max_context)] + c.get("extra", [])
     with open(out_dir / "dump.log", "w", encoding="utf-8") as f:
@@ -186,6 +240,8 @@ def q2k(run, c):
     decode = (DATA / "ref_decode.txt").read_text().strip()
     dump(run, c, DATA / "ref_prompt1024.txt", decode, out, 4096, 1800)
     r = compare(DATA / "ref_logits.bin", out / "decode_logits.f32", 1024, 0)
+    if run.done("ref2k_q8"):   # the same logits against Q8_K_XL's
+        r["q8"] = compare(REF_Q8, out / "decode_logits.f32", 1024, 0)
     (out / "decode_logits.f32").unlink()
     return r
 
@@ -199,7 +255,7 @@ def q128k(run, c, ref, smoke):
     prompt = out / "prompt.txt"
     prompt.write_text(",".join(map(str, toks[:first])))
     decode = ",".join(map(str, toks[first:first + TAIL]))
-    dump(run, c, prompt, decode, out, 8192 if smoke else 132096, 3 * 3600)
+    dump(run, c, prompt, decode, out, 8192 if smoke else 132096, run.timeout or 3 * 3600)
     r = compare(ref["path"], out / "decode_logits.f32", first, TAIL)
     (out / "decode_logits.f32").unlink()
     return r
@@ -244,7 +300,17 @@ def report(run, cs, smoke):
             cell(rl, "kld", "{:.5f}"), cell(rl, "kld99", "{:.5f}"), cell(rl, "top1", "{:.2f}%"),
             f"{rl['ppl_ref']:.4f} / {rl['ppl_engine']:.4f}" if rl else "未実行",
             ("基準" if c is q8 else verdict(rl, base_long)) if rl else ""]) + " |")
-    lines += ["", "構成の中身:", ""] + [f"- {c['name']}: kv {c['kv']}、環境変数 {c.get('env') or 'なし'}、"
+    if any((run.state.get(f"q2k:{c['name']}") or {}).get("q8") for c in cs):
+        lines += ["", "## 2K、unsloth Q8_K_XL の参照との照合 (同じトークン、llama.cpp、KV fp16)", "",
+                  "| 構成 | KLD | KLD 99% | 上位1一致 | PPL (参照/エンジン) |", "|---|---|---|---|---|"]
+        for c in cs:
+            r = (run.state.get(f"q2k:{c['name']}") or {}).get("q8")
+            lines.append(f"| {c['name']} | " + (f"{r['kld']:.5f} | {r['kld99']:.5f} | {r['top1']:.2f}% | "
+                                                 f"{r['ppl_ref']:.4f} / {r['ppl_engine']:.4f} |" if r else "未実行 | | | |"))
+    skipped = run.state.get("_skipped", [])
+    if skipped:
+        lines += ["", "飛ばした手順 (締め切りに間に合わない見込み): " + "、".join(skipped)]
+    lines += ["", "構成の中身:", ""] + [f"- {c['name']}: モデル {model_of(c).name}、kv {c['kv']}、環境変数 {c.get('env') or 'なし'}、"
                                      f"設定 {' '.join(c.get('extra', [])) or 'なし'}。{c.get('note', '')}" for c in cs]
     (run.dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return run.dir / "report.md"
@@ -257,16 +323,28 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="終わった手順も最初からやり直す")
     ap.add_argument("--smoke", action="store_true", help="4K 文脈の小さな参照で 128K の手順の仕組みだけ確かめる")
     ap.add_argument("--estimate", action="store_true", help="所要時間の目安だけ出す")
+    ap.add_argument("--deadline", default=None, help="HH:MM (この PC の時刻)。間に合わない見込みの手順は飛ばす")
     a = ap.parse_args()
     run = Run(a.run or ("smoke" if a.smoke else "main"), a.fresh)
+    run.timeout = None
+    deadline = None
+    if a.deadline:
+        hh, mm = map(int, a.deadline.split(":"))
+        now = datetime.datetime.now()
+        deadline = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if deadline < now:
+            deadline += datetime.timedelta(days=1)
     cs = configs()
     todo = steps(cs, a.smoke)
     times = load_times()
-    left = sum(times[k] for key, k, _ in todo if not run.done(key))
+    for key, k, c in todo:   # a config's own measured time, where there is one
+        if c and group(c) != "base" and f"{k}:{c['name']}" in times:
+            times[key] = times[f"{k}:{c['name']}"]
+    left = sum(times.get(key, times[k]) for key, k, _ in todo if not run.done(key))
     if a.estimate:
         print(f"手順 {len(todo)} 個 (残り {sum(1 for key, _, _ in todo if not run.done(key))} 個)、目安 {fmt_s(left)}")
         for key, k, _ in todo:
-            print(f"  {'済み' if run.done(key) else fmt_s(times[k]):>12}  {key}")
+            print(f"  {'済み' if run.done(key) else fmt_s(times.get(key, times[k])):>12}  {key}")
         return 0
     run.log(f"開始: 構成 {', '.join(c['name'] for c in cs)}。手順 {len(todo)} 個、残りの目安 {fmt_s(left)}")
     bench.stop_server()   # 常駐サーバーの VRAM を空ける
@@ -275,9 +353,21 @@ def main():
         for key, kind, c in todo:
             if run.done(key):
                 continue
-            run.log(f"手順 {key} を始める (目安 {fmt_s(times[kind])})")
+            if deadline is not None:
+                room = (deadline - datetime.datetime.now()).total_seconds()
+                est = times.get(key, times[kind])
+                if est > room:
+                    run.log(f"手順 {key} を飛ばす: 目安 {fmt_s(est)}、締め切り {a.deadline} まで {fmt_s(max(0, room))}")
+                    run.put("_skipped", run.state.get("_skipped", []) + [key])
+                    left -= est
+                    continue
+                run.timeout = max(60, int(room))
+            run.log(f"手順 {key} を始める (目安 {fmt_s(times.get(key, times[kind]))}、残りの目安 {fmt_s(max(0, left))}、"
+                    f"終わりの見込み {(datetime.datetime.now() + datetime.timedelta(seconds=max(0, left))).strftime('%H:%M')})")
             t0 = time.time()
-            if kind in ("ref128k", "ref_smoke"):
+            if kind == "ref2k_q8":
+                r = make_ref_q8(run)
+            elif kind in ("ref128k", "ref_smoke"):
                 ref = make_ref(run, a.smoke)
                 r = ref
             elif kind == "q2k":
@@ -285,9 +375,11 @@ def main():
             else:
                 r = q128k(run, c, ref, a.smoke)
             dt = time.time() - t0
-            save_time(kind, dt)
+            # the SQ models' and the options' times are kept apart from the default's (their speeds differ)
+            tkind = kind if not c or group(c) == "base" else f"{kind}:{c['name']}"
+            save_time(tkind, dt)
             run.put(key, r)
-            left -= times[kind]
+            left -= times.get(key, times[kind])
             run.log(f"手順 {key} が終わった ({fmt_s(dt)}): {json.dumps(r, ensure_ascii=False)}。残りの目安 {fmt_s(max(0, left))}")
             report(run, cs, a.smoke)
     except BaseException as e:

@@ -59,7 +59,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, InklingParser, OutputParser,  # noqa: E402
+from serve.frontend import (INK_END, INK_HEADER, INK_TEXT, INK_THINK, THINK_END, ChatTemplate, Event,  # noqa: E402
+                            InklingParser, OutputParser,
                             anthropic_to_messages, forced_call, gemma_model_turn, images_of, literal_tags,
                             mark_think_literals, openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -3418,6 +3419,10 @@ class Service:
                                                  for s in TURN_OPENERS[self.call_format]) if len(t) == 1)
         self.engine.turn_ids = self.turn_ids            # the GEN line's turn_at (StrataEngine.turn_key)
         self.think_open_ids = []
+        # inkling2 fork: a thinking-off prompt ends with the opening of a text block (render_prompt), which the reply's
+        # parser is told of (run())
+        self.ink_text_open_ids = (tokenizer.encode(INK_HEADER + INK_TEXT, parse_special=True)
+                                  if self.call_format == "inkling" else [])
         if self.call_format == "gemma":
             # after its calls Gemma opens the tools' answer, which is the client's to give: the reply ends there.
             # Its template opens the reasoning for it after a tool's answer; run() looks for that at the prompt's end
@@ -4523,7 +4528,14 @@ class Service:
                 kwargs["reasoning_effort"] = "none"
             elif effort not in (None, ""):
                 kwargs["reasoning_effort"] = INKLING_EFFORT.get(effort, effort)
-            return self.template.render(messages, tools=tools, **kwargs)
+            prompt = self.template.render(messages, tools=tools, **kwargs)
+            if off or kwargs.get("reasoning_effort") == "none":
+                # inkling2 fork (Strata's #6612 / #6627): the template ends on a closed block, and with its effort
+                # at 0 the model still opened a thinking block (290-690 characters for "Say hello in five words.",
+                # once all of max_tokens 200).  Thinking off, the reply's header is written here: a text block, or
+                # with tools an empty thinking block, after which the model opens its text or its call itself
+                prompt += INK_HEADER + INK_THINK + INK_END if tools else INK_HEADER + INK_TEXT
+            return prompt
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             prompt = self.template.render(messages, tools=tools, **kwargs)
             if self.call_format == "gemma":
@@ -4969,7 +4981,9 @@ class Service:
         opened = bool(self.think_open_ids) and ids[-len(self.think_open_ids):] == self.think_open_ids
         parser = (InklingParser if self.call_format == "inkling" else OutputParser)(
             thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-            call_format=self.call_format, opened=opened)
+            call_format=self.call_format, opened=opened,
+            **({"text_opened": ids[-len(self.ink_text_open_ids):] == self.ink_text_open_ids}
+               if self.ink_text_open_ids else {}))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)

@@ -3,7 +3,7 @@
 The package holds bin\\ (strata-inkling2.exe, inkling2_logits_dump.exe, the CUDA and C++ runtime DLLs they need),
 the server, the scripts, the docs and the licenses.  The model is not in it: setup.bat downloads it.
 
-  python tools/package.py [--version 0.1.0] [--build build]
+  python tools/package.py [--version 0.2.0] [--build build]
 
 Redistributed runtime files:
   cublas64_13.dll, cublasLt64_13.dll   NVIDIA CUDA Toolkit, redistributable under the CUDA EULA's Attachment A
@@ -51,7 +51,7 @@ def crt_dir():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", default="0.1.0")
+    ap.add_argument("--version", default="0.2.0")
     ap.add_argument("--build", default=str(ROOT / "build"))
     a = ap.parse_args()
     bin_src = Path(a.build) / "bin"
@@ -86,6 +86,7 @@ def main():
     for f in ("LICENSE",):
         shutil.copy2(ROOT / "third_party" / "llama.cpp" / f, lic / "llama.cpp-LICENSE.txt")
     shutil.copy2(ROOT / "engine" / "LICENSE.PolyStrata", lic / "PolyStrata-LICENSE.txt")
+    shutil.copy2(ROOT / "third_party" / "zstd-dec" / "LICENSE", lic / "zstd-LICENSE.txt")   # its decoder is linked
     zpath = ROOT / "dist" / f"{name}.zip"
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for p in sorted(stage.rglob("*")):

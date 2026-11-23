@@ -202,6 +202,62 @@ void route_rows(const float* logits, int n_expert, int n_used, int rows, int gat
 /// acc[t] += sum over k < n_used of w[t * n_used + k] * x[t * n_used + k], for rows of n values: a token's
 /// weighted experts added to its row.
 void moe_sum(const float* x, const float* w, float* acc, int n, int n_used, int rows, void* stream);
+// inkling2 fork (kernels_sq.cu): y[t][i] *= s[i] for n tokens (a .strata Q8_ROW matrix's row scales), and y = W x for
+// a matrix of .strata S_K blocks of `code` (strata/sq/sq_types.hpp), x in floats
+void mul_cols(float* y, const float* s, int n_out, int n, void* stream);
+void sq_gemv(int code, const uint8_t* w, const float* x, float* y, int n_in, int n_out, int n, void* stream);
+// inkling2 fork: a few tokens' .strata experts in VRAM (Inkling 2 Mini's 2304 x 1152, kernels_sq.cu).  Job j is an
+// expert's body in VRAM, its down's offset in it, and its token's row of x; all of one launch have the same code.
+// sq_experts_gu: act[j] (1152 floats) = SiTU(beta, lb) of gate and up (and / sq for S_K); sq_experts_dn:
+// y + j * y_stride (2304 floats) = down act[j].  Every weight decoded exactly, summed in floats.
+constexpr int kSqJobs = 32, kSqEmbd = 2304, kSqFf = 1152;
+struct SqJobs {
+    const uint8_t* body[kSqJobs];
+    uint32_t dn_off[kSqJobs];
+    int row[kSqJobs];
+    uint8_t gu[kSqJobs], dn[kSqJobs];   ///< each job's S_K codes (sq_experts_*_dp_any())
+};
+void sq_experts_gu(int code, const SqJobs& jobs, int n, const float* x, size_t x_stride, float* act, float beta,
+                   float lb, void* stream);
+void sq_experts_dn(int code, const SqJobs& jobs, int n, const float* act, float* y, size_t y_stride, void* stream);
+// the same for S_K by Strata's integer sums (kernels_sq_strata.cuh): x and h quantized to its Q8_1_G64 blocks (80
+// bytes a 64 values; sq_quantize_g64), job j's row of xq its token's and hq row j its own; y without the weight
+constexpr int kSqG64Bytes = 80;
+void sq_quantize_g64(const float* x, void* q, int rows, int cols, void* stream);
+void sq_experts_gu_dp(int code, const SqJobs& jobs, int n, const void* xq, float* act, void* stream);
+void sq_experts_dn_dp(int code, const SqJobs& jobs, int n, const void* hq, float* y, size_t y_stride, void* stream);
+// the same with each job's codes its own (SqJobs::gu / dn, S_K only): one launch for a token's experts
+void sq_experts_gu_dp_any(const SqJobs& jobs, int n, const void* xq, float* act, void* stream);
+// SF4 gate|up and down (both SF4) for one token a job as Strata's decode kernels (x and h in halves); y unweighted.
+// INKLING2_SQ_SF4_FLOAT=1 keeps the float kernels above (sq_experts_gu / sq_experts_dn)
+void sq_experts_sf4_h(const SqJobs& jobs, int n, const float* x, size_t x_stride, float* act, float* y,
+                      size_t y_stride, void* stream);
+void sq_experts_dn_dp_any(const SqJobs& jobs, int n, const void* hq, float* y, size_t y_stride, void* stream);
+// A prompt batch's experts (Strata's k_ink_moe_sk_tc and k_ink_moe_sf4_mx8_fp16tc): `experts` 128 SqTcExpert (body:
+// its device address; tier 0 for the experts of this round, 2 for the others), the tables those kernels take (the
+// pairs t * used + k sorted by expert, tiles of 16 of an expert's pairs), x the m tokens' inputs, h [pairs][1152],
+// y [pairs][2304] (weighted); xq and hq the Q8_1_G64 blocks of x and h.  sq_rows_add(): out[t] += token t's pairs
+// whose expert is in the round.
+struct SqTcExpert {
+    uint64_t body;
+    uint32_t dn_off;
+    uint8_t gu, dn;
+    uint16_t tier;
+};
+struct SqTcTables {
+    const void* experts;
+    int32_t *cnt, *off, *active, *nact, *pairs, *tok_idx, *n_tiles;
+    void* tiles;   // int2 {expert, first pair row}
+    const float* w;
+};
+constexpr unsigned kSqTcGuSf4 = 1, kSqTcGuSk = 2, kSqTcDnSf4 = 4, kSqTcDnSk = 8;
+void sq_rows_round(const SqTcTables& t, int n_tiles, unsigned kinds, const float* x, int m, void* xq, float* h,
+                   void* hq, int pairs, float* y, void* stream);
+void sq_rows_add(const float* y, const int32_t* ids, const void* experts, float* out, int m, int used, void* stream);
+// INKLING2_SQ_W4A4 (strata_fp4/sq_w4a4.cu): the round's SF4 experts with FP4 activations, xa m * 1728 bytes, ha
+// pairs * 864; on an RTX 50 only (sq_w4a4_available())
+bool sq_w4a4_available();
+void sq_rows_w4a4(const SqTcTables& t, int n_tiles, const float* x, int m, void* xa, void* ha, float* y, void* stream);
 // inkling2 fork: the stream waits (one thread on the card) until the pinned *flag reaches want; *err is set if it
 // waited 10 s
 void wait_host_flag(const unsigned* flag, unsigned want, unsigned* err, void* stream);

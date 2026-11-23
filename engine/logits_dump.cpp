@@ -148,6 +148,9 @@ int main(int argc, char** argv) {
             else if (a == "--no-gpu-experts") o.gpu_experts = false;
             else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
             else if (a == "--layer-split") o.layer_split = val();
+            else if (a == "--skip-weight") o.skip_weight = (float) std::atof(val());   // inkling2 fork: as the server
+            else if (a == "--tail-skip") o.tail_skip = std::atoi(val());
+            else if (a == "--skip-renorm") o.skip_renorm = true;
             else if (a == "--reload") reload = true;
             else if (a == "--images") images = val();
             else if (a == "--image-pad") image_pad = (int32_t) std::atoi(val());

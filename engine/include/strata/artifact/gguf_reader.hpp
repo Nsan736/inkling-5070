@@ -36,6 +36,7 @@
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/artifact/model_family.hpp"
+#include "strata/sq/sq_reader.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -116,6 +117,8 @@ inline const char* ggml_type_name(uint32_t t) {
     case 42:
         return "Q2_0";
     default:
+        // inkling2 fork: a .strata matrix's S_K code (strata/sq/sq_types.hpp)
+        if (sq::is_sq_type(t)) return sq::code_name((int) (t - sq::kTypeBase));
         return "?";
     }
 }
@@ -234,6 +237,11 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         bytes = 18;
         return true;
     default:
+        if (sq::is_sq_type(t)) {   // inkling2 fork: a .strata matrix's S_K blocks
+            elems = 256;
+            bytes = sq::sk_block_bytes((int) (t - sq::kTypeBase));
+            return true;
+        }
         return false;
     }
 }
@@ -243,6 +251,8 @@ struct TensorInfo {
     std::vector<uint64_t> shape; // GGUF order: dim 0 varies fastest
     uint32_t type = 0;
     uint64_t offset = 0;
+    /// inkling2 fork: a tensor of a .strata file that was rewritten into memory of its own (strata/sq/sq_reader.hpp)
+    const uint8_t* ptr = nullptr;
     uint64_t elements() const {
         uint64_t n = 1;
         for (auto d : shape) n *= d;
@@ -389,7 +399,11 @@ public:
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
     }
-    const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+    const uint8_t* tensor_data(const TensorInfo& t) const { return t.ptr ? t.ptr : base_ + data_start_ + t.offset; }
+    /// The mapped file's first byte.
+    const uint8_t* base() const { return base_; }
+    /// inkling2 fork: a .strata file's experts and what else it holds beside the tensors; null for a GGUF
+    const sq::Parsed* strata() const { return sq_.get(); }
 
 private:
     void open() {
@@ -441,7 +455,39 @@ private:
 #endif
     }
 
+    // inkling2 fork: a .strata file (Strata's SQ builds of Inkling 2 Mini) as the GGUF of the same model: the
+    // metadata of that GGUF (inkling2_meta.inc), the trunk under its tensor names (sq::parse())
+    void parse_strata() {
+        static const uint8_t kMeta[] = {
+#include "strata/sq/inkling2_meta.inc"
+        };
+        Cursor m(kMeta, sizeof(kMeta));
+        if (m.read<uint32_t>() != 0x46554747u || m.read<uint32_t>() != 3) throw std::runtime_error("inkling2_meta.inc");
+        if (m.read<uint64_t>() != 0) throw std::runtime_error("inkling2_meta.inc has tensors");
+        const uint64_t n_kv = m.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            std::string key = m.str();
+            MetaType t = (MetaType) m.read<uint32_t>();
+            meta_.emplace(std::move(key), read_value(m, t));
+        }
+        sq_ = std::make_unique<sq::Parsed>(sq::parse(base_, (size_t) size_));
+        version_ = 3;
+        data_start_ = 0;
+        alignment_ = 4096;
+        for (sq::Tensor& x : sq_->tensors) {
+            TensorInfo t;
+            t.name = x.name;
+            t.shape = x.shape;
+            t.type = x.type;
+            const bool mapped = x.ptr >= base_ && x.ptr < base_ + size_;
+            t.offset = mapped ? (uint64_t) (x.ptr - base_) : 0;
+            t.ptr = mapped ? nullptr : x.ptr;
+            tensors_.push_back(std::move(t));
+        }
+    }
+
     void parse() {
+        if (sq::is_strata(base_, (size_t) size_)) return parse_strata();
         Cursor c(base_, size_);
         const uint32_t magic = c.read<uint32_t>();
         if (magic != 0x46554747u) throw std::runtime_error("not a GGUF file (bad magic)");
@@ -500,6 +546,7 @@ private:
 #endif
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
+    std::unique_ptr<sq::Parsed> sq_;
 };
 
 // Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole

@@ -36,10 +36,14 @@ namespace strata {
 struct TensorInfo;
 struct MetaValue;
 }
+namespace strata::sq {
+struct Expert;   // inkling2 fork: strata/sq/sq_reader.hpp
+}
 
 namespace strata::poly {
 
 class Shards;
+struct SqCpuExpert;   ///< inkling2 fork: sq/cpu_sq.hpp
 struct Likeliest;
 
 /// The attention caches' storing format, opt-in via --kv.  q8_0 is ggml's blocks (one fp16 scale a 32-value
@@ -115,6 +119,11 @@ struct Options {
     float skip_weight = 0;        ///< in place of tail_skip: a routed expert outside VRAM whose router weight is under
                                   ///< this share of its token's experts' weight, for every token of the call, is left
                                   ///< out (--skip-weight); 0: tail_skip decides
+    bool skip_renorm = false;     ///< inkling2 fork: with skip_weight or tail_skip, a token's experts that are kept
+                                  ///< take the left-out ones' weight in proportion (--skip-renorm); off: they keep
+                                  ///< the router's weights
+    bool skip_in_prompt = false;  ///< inkling2 fork: skip_weight / tail_skip in read() too (--skip-in-prompt); off:
+                                  ///< only while writing
     float cache_bias = 0;         ///< a token's few-at-a-time routing adds this to the score of each expert in VRAM
                                   ///< before it picks its experts; their weights stay the softmax of the scores the
                                   ///< router gave (--cache-bias, qwen35moe only); 0: the router's own picks
@@ -138,6 +147,9 @@ struct Dev {
     uint32_t type = 0;
     int n_in = 0, n_out = 0;
     float scale = 1.0f;   ///< on the product: an NVFP4 matrix's global scale (Engine::global_scale())
+    /// inkling2 fork: each output row's own scale on the product (a .strata Q8_ROW matrix read as Q8_0 blocks of
+    /// scale 1: strata/sq/sq_reader.hpp); null for every other matrix
+    const float* rscale = nullptr;
 };
 
 /// What a layer has in every architecture.  Its attention's weights, and a dense FFN's, are the architecture's.
@@ -172,6 +184,11 @@ struct Layer {
     // GGUF's ffn_*_exps.scale), on the card and here; none in any other file
     Dev s_gate, s_up, s_down;
     std::vector<float> h_s_gate, h_s_up, h_s_down;
+    /// inkling2 fork: a .strata file's layer: each expert's formats and body (strata/sq/sq_reader.hpp), n_expert of
+    /// them, which the SQ kernels run in place of the GGUF formats above (those stay 0)
+    const sq::Expert* sq_ex = nullptr;
+    bool sq() const { return sq_ex != nullptr; }
+    std::vector<size_t> sq_cap;   ///< inkling2 fork: each slot's bytes in a .strata layer (its first expert's size)
     std::vector<uint8_t*> slot;        ///< per expert: gate | up | down in VRAM, or null
     size_t slot_bytes = 0;             ///< from a slot of the layer to the one behind it: whole blocks of both types
     std::vector<int32_t> ahead;        ///< experts a full prompt batch stages before it routes
@@ -822,6 +839,7 @@ protected:
     const uint8_t* tok_embd_ = nullptr;   ///< the token table in the mapped file, tok_row_ bytes a token
     size_t tok_row_ = 0;
     uint32_t tok_type_ = 0;
+    const float* tok_rscale_ = nullptr;   ///< inkling2 fork: a .strata token table's row scales (mapped), or null
 
     uint8_t* dense_ = nullptr;   ///< the dense weights' arena
     size_t dense_bytes_ = 0, dense_at_ = 0;
@@ -1087,6 +1105,7 @@ protected:
     // first call has the slots take the experts it used most (pool_reseed()).
     std::vector<float> prompt_use_;
     int64_t prompt_rows_ = 0;
+    bool reading_ = false;   ///< inkling2 fork: inside read() (a prompt), where Options::skip_weight leaves none out
     void pool_reseed();
     // Read ahead: moe_router() also scores the next MoE layer's router on this layer's input (on the card, copied to
     // h_ahead_ before ev_, a part of a window apiece, as ev_row_; a head recorded as a graph copies it too), and
@@ -1125,7 +1144,27 @@ protected:
     bool split_ok(const Layer& L, int n) const;
     void sync_slots();
     void moe_split_launch(Layer& L, int il, int n, void* ev = nullptr);
+    void shrink_sq_cache(size_t end);
+    bool moe_sq_rows(Layer& L, int il, int n);
+    static constexpr int kSqRowsMin = 32;   ///< a .strata layer's batches of this many tokens go to moe_sq_rows()
+    uint8_t* sq_stage_ = nullptr;          ///< its experts outside VRAM, a round at a time
+    uint8_t* h_sq_stage_ = nullptr;        ///< and their pinned copy
+    size_t sq_stage_bytes_ = 0;
+    int sq_rows_max_ = 0;                  ///< the tokens of a launch
+    void* sq_tab_ = nullptr;               ///< a launch's tables
+    void* h_sq_tab_[2] = {};               ///< and their pinned copies, a turn each
+    void* ev_sq_tab_[2] = {};
+    void* ev_sq_stage_ = nullptr;
+    int sq_turn_ = 0;
+    int sq_w4a4_ = -1;
+    bool mmq_experts_ = false;             ///< some layer's routed experts go through MMQ (mmq_ may be the trunk's alone)                     ///< INKLING2_SQ_W4A4 (opt-in), -1 until moe_sq_rows() asks
+    std::vector<int32_t> sq_ids_;
+    std::vector<float> sq_w_;
     std::vector<void*> pipe_ev_;        ///< INKLING2_CARD_PIPE: a visit's picks are on the host
+    std::vector<SqCpuExpert> sq_host_;   ///< inkling2 fork: a .strata layer's experts of a call, for the CPU
+    std::vector<SqCpuExpert> sq_card_;   ///< and the ones in VRAM (body: the slot)
+    void* sq_xq_ = nullptr;             ///< the Q8_1_G64 blocks of a call's expert inputs (kCpuRows rows)
+    void* sq_hq_ = nullptr;             ///< and of a launch's activations (kSqJobs rows)
     void* split_wait_ev_ = nullptr;     ///< the one moe() waits for
     int64_t flag_waits_ = 0, flag_fallbacks_ = 0;
     // inkling2 fork, INKLING2_DSPARK=mtp.safetensors (off by default): Inkling 2 Mini's DSpark block drafter (dspark.hpp)

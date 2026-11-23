@@ -19,16 +19,30 @@ Source code in this repository
   - engine/: the strata-poly engine cut down to Inkling 2 (engine/UPSTREAM.md lists every file).
   - server/serve, server/tools/strata_tokenizer.py, server/tools/gguf_reader.py: the OpenAI- and
     Anthropic-compatible server and the tokenizer, unchanged except that the server also recognizes
-    this engine's name (strata-inkling2).
+    this engine's name (strata-inkling2) and, with thinking off, opens Inkling 2's reply as a text block
+    (serve/server.py's render_prompt and serve/frontend.py's InklingParser; after Strata's #6612 / #6627).
 
 - Strata pull request #6506 (ik2), MIT License, Copyright (c) 2026 Peasant Smith, OscarSheng,
   alesha-pro, cobra91 and the Project Maya contributors: engine/dspark.cu and engine/dspark.hpp
   (the optional DSpark drafter) are ported from its engine/src/ik2/ik2_draft.cu and ik2_kernels.cu.
 
+- Strata v0.2.19 (https://github.com/Niko1221/Strata), MIT License, Copyright (c) 2026 Niko1221 and the Strata
+  contributors: the reading and running of its .strata v1.1 SQ builds (in the engine, not used with the GGUF
+  models setup offers):
+  engine/include/strata/sq/sq_json.hpp (ink_json.h), engine/sq/sq_cpu_eval.hpp (ink_hybrid.cuh's host
+  evaluator, with S2_K / S3_K unpacked by AVX2 added: bit-identical to its loop), engine/kernels_sq_strata.cuh (definitions copied whole from cuda/ink_cuda.cuh and
+  cuda/ink_moe_cuda.cuh: the S_K decode dot products, the Q8_1_G64 quantizer, the prompt batches' int8 and fp16
+  tensor-core kernels), and engine/strata_fp4/ (cuda/ink_moe_fp4_sm120.cu/.cuh and cuda/ink_cuda.cuh with the
+  namespace renamed: the opt-in W4A4 SF4 prompt kernels).
+
 - llama.cpp / ggml (https://github.com/ggml-org/llama.cpp) at 3cf03257f219afbe7334045ff7c6a06ac68c627d,
   MIT License, Copyright (c) 2023-2026 The ggml authors: third_party/llama.cpp/ggml (ggml-base and
   ggml-cpu for the CPU experts, and ggml-cuda's MMQ kernels for reading prompts). The licenses of
   the code it vendors are in third_party/llama.cpp/licenses.
+
+- Zstandard (https://github.com/facebook/zstd), its decoder only, BSD License, Copyright (c) Meta Platforms,
+  Inc. and affiliates: third_party/zstd-dec (linked into the engine for the .strata reader). Its license is
+  third_party/zstd-dec/LICENSE (licenses/zstd-LICENSE.txt in the package).
 
 - tools/dev/llamacpp_ppl_tail.patch is a change to llama.cpp's tools/perplexity/perplexity.cpp
   (MIT, The ggml authors) used only to make reference logits for the quality checks.
