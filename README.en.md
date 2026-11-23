@@ -30,6 +30,8 @@ the experts that do not fit in VRAM computed on the CPU.
 - Engine: PolyStrata's `strata-poly` (on Strata) cut down to Inkling 2 and tuned on Windows. Server: PolyStrata's.
   See [UPSTREAM.md](UPSTREAM.md) and [NOTICE](NOTICE).
 
+Much of the code and documentation was written with the help of AI.
+
 Measured on: RTX 5070 12 GB, Core Ultra 7 265K, DDR5-5600 32 GB, Windows 11, driver 610.60.
 
 ## What to use, by VRAM
@@ -38,11 +40,12 @@ Writing speed (temperature 1.0, tok/s): after an 8K prompt, or after reading the
 
 | VRAM | Choice | 8K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| 12 GB | IQ4_XS (default), 128K | 66.7 | 51.2 | 43.8 | 33.6 (`--context 256k`) |
+| 12 GB | IQ4_XS (default), 128K | ~67 | ~51 | ~43-45 | 33.6 (`--context 256k`) |
 | 8 GB | IQ4_XS (quality) | 51.4 | 34.3 | 25.3 | does not fit |
 | 8 GB | Q3_K_XL (speed) | 57.6 | 38.8 | 26.1 | does not fit |
 | 6 GB | IQ4_XS or Q3_K_XL, up to 64K | 35.0 / 39.0 | 19.4 / 22.2 | does not fit | does not fit |
 
+- The figures vary by about ±2% between measuring sessions.
 - **8 GB / 6 GB:** measured on this RTX 5070 with its VRAM limited by `--vram-reserve-mib` (not on real cards), with
   2,048-token prompt batches. setup picks 1,024 / 512 for those cards, which leaves more VRAM for experts, so writing
   should be faster than this (not measured).
@@ -55,11 +58,12 @@ Quality: 2K context against Unsloth's Q8_K_XL logits (llama.cpp); a lower KLD is
 
 | Model (`--model`) | File | Mean KLD | Top-1 | 12 GB writing (8K / 128K) |
 |---|---|---|---|---|
-| `iq4_xs` (default) | 15.7 GB | 0.0026 | 98.4% | 66.7 / 43.8 |
+| `iq4_xs` (default) | 15.7 GB | 0.0026 | 98.4% | ~67 / ~43-45 |
 | `q3_k_xl` | 13.6 GB | 0.0090 | 97.2% | 69.0 / 45.1 |
 | `q2_k_xl` | 9.1 GB | 0.0535 | 93.5% | 74.0 / 45.4 |
 | `iq2_xxs` | 8.5 GB | 0.0687 | 90.8% | 79.9 / 51.6 |
 
+- Speeds vary by about ±2% between measuring sessions.
 - Q2_K_XL and IQ2_XXS are fast, but their measured quality drop is large (KLD about 20-26x IQ4_XS's); setup says so
   when one is chosen.
 - The smaller models come from the same Unsloth repository and revision, SHA-256 checked.
@@ -84,15 +88,16 @@ One request; 200 tokens after the first 16. 128K = a 120K-token code context plu
 
 | | This engine | NInfer 2026-11-22.2 (Windows) |
 |---|---|---|
-| 8K, temperature 1.0 | 67.1 tok/s | 49.7 tok/s |
+| 8K, temperature 1.0 | ~67 tok/s | 49.7 tok/s |
 | 8K, greedy | 68.9 tok/s | 51.5 tok/s |
 | 8K, greedy + lookup drafting | 69.7 tok/s | |
 | 8K prompt | 2,247 tok/s | 2,171 tok/s |
-| 128K, temperature 1.0 | 44.8 tok/s | 26.2 tok/s |
+| 128K, temperature 1.0 | ~43-45 tok/s | 26.2 tok/s |
 | 128K, greedy | 42.9 tok/s | 26.3 tok/s |
 | 128K prompt (whole context) | 1,738 tok/s | 663 tok/s |
 | CPU while writing | 7-8 cores | ~10 cores |
 
+- This engine's figures vary by about ±2% between measuring sessions.
 - NInfer: `--expert-residency host --host-cache-mib 1024 --spec none`, MXFP8 KV, same tokens. Its top_k is capped
   at 20 (this engine samples from the whole vocabulary). Its docs report 83.5 tok/s on an RTX 5070 under Linux;
   on Windows it disables CUDA graphs for this model. [docs/ninfer_comparison.md](docs/ninfer_comparison.md)
@@ -111,12 +116,13 @@ experts in VRAM are always computed). The output changes; off by default. Add it
 
 | `--skip-weight` | 128K writing (IQ4_XS, 12 GB) | 2K KLD vs Q8 |
 |---|---|---|
-| none (default) | 43.0 tok/s | 0.0026 |
+| none (default) | ~43-45 tok/s (43.0 in this table's session) | 0.0026 |
 | 0.06 | 45.1 tok/s (+5%) | 0.0031 |
 | 0.08 | 46.7 tok/s (+9%) | 0.0038 (0.0047 with a 128K-sized cache) |
 | 0.12 | 50.5 tok/s (+17%) | 0.0071 (0.0106) |
 
-Little gain where most experts are in VRAM (8K). Quality at 128K was not measured.
+The percentages compare runs of one session; the figures vary by about ±2% between sessions. Little gain where most
+experts are in VRAM (8K). Quality at 128K was not measured.
 
 ## Requirements
 
