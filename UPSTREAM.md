@@ -6,6 +6,7 @@
 | `engine/dspark.cu`, `engine/dspark.hpp` | Strata pull request #6506, `engine/src/ik2/ik2_draft.cu` and parts of `ik2_kernels.cu` | MIT |
 | `third_party/llama.cpp/ggml` | llama.cpp `3cf03257` (unchanged; the pin PolyStrata uses) | MIT |
 | `server/serve`, `server/tools/strata_tokenizer.py`, `server/tools/gguf_reader.py` | PolyStrata `serve/` and `tools/` at `6e610541`, without its tests; with thinking off the reply opens as a text block (after Strata's #6612 / #6627) | MIT |
+| `tools/vision` (strata-vision, the image encoder) | PolyStrata `tools/vision` at `6e610541`, unchanged; built on llama.cpp `690b87d88`'s mtmd (CPU) | MIT |
 | everything else | this project | MIT |
 
 ## This project's changes to the engine

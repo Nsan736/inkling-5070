@@ -1,9 +1,9 @@
 """Make the Windows release package (a .zip for GitHub Releases) from a release build (tools\\build.bat).
 
-The package holds bin\\ (strata-inkling2.exe, inkling2_logits_dump.exe, the CUDA and C++ runtime DLLs they need),
+The package holds bin\\ (strata-inkling2.exe, inkling2_logits_dump.exe, strata-vision.exe, the CUDA and C++ runtime DLLs they need),
 the server, the scripts, the docs and the licenses.  The model is not in it: setup.bat downloads it.
 
-  python tools/package.py [--version 0.2.0] [--build build]
+  python tools/package.py [--version 0.3.0] [--build build]
 
 Redistributed runtime files:
   cublas64_13.dll, cublasLt64_13.dll   NVIDIA CUDA Toolkit, redistributable under the CUDA EULA's Attachment A
@@ -51,7 +51,7 @@ def crt_dir():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", default="0.2.0")
+    ap.add_argument("--version", default="0.3.0")
     ap.add_argument("--build", default=str(ROOT / "build"))
     a = ap.parse_args()
     bin_src = Path(a.build) / "bin"
@@ -65,6 +65,11 @@ def main():
     (stage / "bin").mkdir(parents=True)
     for e in EXES:
         shutil.copy2(bin_src / e, stage / "bin" / e)
+    # the image encoder (toolsuild_vision.bat): setup's --vision cpu, the default
+    vision = ROOT / "build-vision" / "bin" / "strata-vision.exe"
+    if not vision.exists():
+        sys.exit(f"{vision} is missing: run tools\build_vision.bat first (LLAMA_DIR: a llama.cpp checkout)")
+    shutil.copy2(vision, stage / "bin" / vision.name)
     cb = cuda_bin()
     for d in CUDA_DLLS:
         shutil.copy2(cb / d, stage / "bin" / d)

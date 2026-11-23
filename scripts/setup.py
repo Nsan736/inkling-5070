@@ -92,6 +92,22 @@ def physical_cores():
         return max(1, (os.cpu_count() or 8) // 2)
 
 
+# --vision cpu: the image encoder (PolyStrata's strata-vision on llama.cpp's mtmd, built without CUDA: no VRAM) and
+# ggml-org's encoder weights, the file PolyStrata checks Inkling 2's pictures with
+VISION_MMPROJ = {"file": "mmproj-Inkling-2-Mini-Q8_0.gguf", "size": 345_910_944,
+                 "sha256": "233287272ec5ac39b4168677aba54a4c024f202410f5629fac1830e1059f8abb",
+                 "repo": "ggml-org/Inkling-2-Mini-GGUF",
+                 "url": "https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF/resolve/"
+                        "db61c5b492a6a034d986328d28274af0a439aa6c/mmproj-Inkling-2-Mini-Q8_0.gguf"}
+
+
+def vision_exe():
+    for p in (ROOT / "bin" / "strata-vision.exe", ROOT / "build-vision" / "bin" / "strata-vision.exe"):
+        if p.exists():
+            return p
+    return None
+
+
 def engine_exe():
     for p in (ROOT / "bin" / "strata-inkling2.exe", ROOT / "build" / "bin" / "strata-inkling2.exe"):
         if p.exists():
@@ -329,6 +345,12 @@ def main():
     ap.add_argument("--limit-ram-gb", type=float, help="settings as if the PC had this much RAM")
     ap.add_argument("--limit-vram-gb", type=float, help="settings for this much VRAM (the rest is left free)")
     ap.add_argument("--port", type=int, default=0, help=f"the server's port (default {DEFAULT_PORT})")
+    ap.add_argument("--vision", choices=("off", "cpu"), default=None,
+                    help="pictures in requests: cpu (default) runs the image encoder on the CPU - no VRAM, about "
+                         "0.5 GB of RAM while pictures come; about 0.7 s for a 640 x 400 picture, 5.8 s for 1920 x "
+                         "1200 on a Core Ultra 7 265K; off: text only")
+    ap.add_argument("--vision-max-tokens", type=int, default=1024,
+                    help="the most tokens a picture takes (a larger one is scaled down first); default 1024")
     ap.add_argument("--context", type=context_arg, default=0,
                     help="the context length instead of the chosen one: tokens, or 64k / 128k / 256k")
     ap.add_argument("--gpu", type=int, default=0, help="which NVIDIA GPU (nvidia-smi's index)")
@@ -338,6 +360,15 @@ def main():
                          "iq2_xxs (faster on 8 GB and 6 GB cards and at 256K, lower quality; checked at 2K only)")
     a = ap.parse_args()
     m = MODELS[a.model]
+    # --vision: cpu unless asked otherwise; when not asked for, a missing encoder (a build without it) is text only
+    vision_asked = a.vision is not None
+    a.vision = a.vision or "cpu"
+    if a.vision == "cpu" and not vision_exe():
+        if vision_asked:
+            fail("the image encoder is missing: bin\\strata-vision.exe (release package) or build-vision\\bin "
+                 "(tools\\build_vision.bat)")
+        say("note: no image encoder (bin\\strata-vision.exe): pictures stay off (tools\\build_vision.bat builds it)")
+        a.vision = "off"
     say("== Checking this PC")
     if sys.platform != "win32":
         fail("this setup is for Windows")
@@ -401,6 +432,16 @@ def main():
             subprocess.run([sys.executable, "-I", str(ROOT / "server" / "tools" / "strata_tokenizer.py"), "--gguf",
                             str(src), "--out", str(ROOT / "data"), "--check"], check=True)
         say(f"  {tok}")
+        if a.vision == "cpu":
+            say("== The image encoder")
+            mp = models / VISION_MMPROJ["file"]
+            if not (mp.exists() and mp.stat().st_size == VISION_MMPROJ["size"] and (models / (mp.name + ".ok")).exists()):
+                if not (mp.exists() and mp.stat().st_size == VISION_MMPROJ["size"]):
+                    download(mp, VISION_MMPROJ)
+                if sha256(mp, VISION_MMPROJ["size"]) != VISION_MMPROJ["sha256"]:
+                    fail(f"SHA-256 mismatch for {mp.name}. Delete it and run setup again.")
+                (models / (mp.name + ".ok")).write_text(VISION_MMPROJ["sha256"])
+            say(f"  {mp}")
     elif not model.exists():
         fail(f"{model} is missing; run setup.bat without --configure-only first")
 
@@ -432,6 +473,20 @@ def main():
            "limits": {"ram_gb": a.limit_ram_gb, "vram_gb": a.limit_vram_gb}}
     if a.gpu:
         cfg["gpu"], cfg["gpus_asked"] = a.gpu, True   # the server tells the engine this card
+    if a.vision == "cpu":
+        vexe, mp = vision_exe(), models / VISION_MMPROJ["file"]
+        if not mp.exists():
+            if vision_asked:
+                fail(f"{mp} is missing; run setup.bat --vision cpu without --configure-only first")
+            say(f"  note: {mp.name} is missing (setup without --configure-only fetches it): pictures stay off")
+            vexe = None
+        # on the CPU: it starts with the first picture and stops after two idle minutes (the server's default for a
+        # CPU encoder), so its RAM is taken only while pictures come
+        if vexe:
+            cfg["vision"] = {"exe": str(vexe), "mmproj": str(mp), "model": str(model), "threads": chosen["threads"],
+                             "max_tokens": a.vision_max_tokens}
+            say(f"  vision: on the CPU ({chosen['threads']} threads, up to {a.vision_max_tokens} tokens a picture; "
+                "setup --vision off for text only)")
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     (ROOT / "logs").mkdir(exist_ok=True)
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")

@@ -40,6 +40,12 @@ Source code in this repository
   ggml-cpu for the CPU experts, and ggml-cuda's MMQ kernels for reading prompts). The licenses of
   the code it vendors are in third_party/llama.cpp/licenses.
 
+- strata-vision, the image encoder: PolyStrata's tools/vision (strata_vision.cpp and its CMakeLists.txt, from the
+  same PolyStrata commit, MIT License, the PolyStrata copyright above) in tools/vision, unchanged. Its build,
+  bin/strata-vision.exe in the package, statically links llama.cpp's llama and mtmd libraries and ggml (CPU only)
+  from llama.cpp (https://github.com/ggml-org/llama.cpp) at 690b87d88, MIT License, Copyright (c) 2023-2026 The ggml
+  authors (licenses/llama.cpp-LICENSE.txt in the package).
+
 - Zstandard (https://github.com/facebook/zstd), its decoder only, BSD License, Copyright (c) Meta Platforms,
   Inc. and affiliates: third_party/zstd-dec (linked into the engine for the .strata reader). Its license is
   third_party/zstd-dec/LICENSE (licenses/zstd-LICENSE.txt in the package).
@@ -62,10 +68,13 @@ Files in the Windows release package
 The model
 ---------
 
-The model is not included; setup.bat downloads it from Hugging Face.
+The model is not included; setup.bat downloads it (and the image encoder's weights) from Hugging Face.
 
 - Inkling 2 Mini by Thinking Machines (https://huggingface.co/thinkingmachines/Inkling-2-Mini),
   Apache License 2.0.
+- The image encoder's weights, mmproj-Inkling-2-Mini-Q8_0.gguf (setup.bat --vision cpu, the default, downloads
+  it), are ggml-org's conversion (https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF, revision
+  db61c5b492a6a034d986328d28274af0a439aa6c) of the model's vision tower, Apache License 2.0 as the model.
 - The GGUF file used, Inkling-2-Mini-UD-IQ4_XS.gguf, is Unsloth's quantization
   (https://huggingface.co/unsloth/Inkling-2-Mini-GGUF, revision
   45fd08764f2b0bf16b03a5483a80e5c7aaec8772), Apache License 2.0.

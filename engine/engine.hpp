@@ -314,6 +314,7 @@ public:
     /// buffer.  window() and step() do it too, if the caller has not.
     void end_read() {
         if (stage_lent_) narrow_stage();
+        if (scratch_lent_) narrow_scratch();
     }
 
     /// Whether the architecture reads pictures.
@@ -712,6 +713,11 @@ protected:
     int grow_cache(size_t bytes, bool later = false);
     void fill_now();
     void widen_stage();
+    // inkling2 fork, INKLING2_WIDE_READ=N (opt-in): scratch_ laid out for N rows while writing, for the prompt batch
+    // (rows_wide_) while reading, its VRAM in between lent by the expert cache (widen_scratch() / narrow_scratch())
+    void carve_scratch(int rows);
+    void widen_scratch();
+    void narrow_scratch();
     void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
     bool mind_card_vram();
@@ -994,6 +1000,14 @@ protected:
     Mapped stage_map_;                            ///< stage_'s VRAM when it can grow for a read (stage_read_mib)
     size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one
     bool stage_lent_ = false;                     ///< the expert cache has lent the buffer VRAM (widen_stage())
+    Mapped scratch_map_;                          ///< inkling2 fork: scratch_ when INKLING2_WIDE_READ
+    int rows_wide_ = 0, rows_narrow_ = 0;         ///< the prompt batch and the rows while writing; 0: not wide-read
+    size_t scratch_wide_ = 0, scratch_narrow_ = 0;   ///< scratch_'s floats for each
+    size_t scratch_cut_ = 0;                      ///< what the expert cache gave up for the wide layout
+    bool scratch_lent_ = false;
+    /// inkling2 fork, INKLING2_KICK (opt-in, bits): cudaStreamQuery so that WDDM hands the launches to the card at
+    /// once: 1 after the shared expert, 2 after the cached experts' launches, 4 after a written token's layer
+    int kick_ = std::getenv("INKLING2_KICK") ? std::atoi(std::getenv("INKLING2_KICK")) : 0;
     size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_, round_row_;

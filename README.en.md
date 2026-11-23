@@ -6,11 +6,12 @@
 > [PolyStrata](https://github.com/simplexai-labs/PolyStrata); it is not part of either project and is not supported
 > by their authors.
 
-> **Status (0.2.0)**
+> **Status (0.3.0)**
 > - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0049, top-1 agreement 97.4% at a 2K
 >   context; mean KLD 0.0075, top-1 96.9% at a 128K context.
 > - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0026, top-1 98.4%.
 > - The smaller models (Q3_K_XL / Q2_K_XL / IQ2_XXS) were checked at 2K only.
+> - Pictures: a photo, a screenshot and a chart were described correctly (no benchmark).
 > - Tested on one PC only (RTX 5070 / Windows 11). The 8 GB and 6 GB figures were measured on that RTX 5070 with its
 >   VRAM limited; no real 8 GB or 6 GB card has been tried.
 > - setup's model download has not been tried end to end yet (the SHA-256 check has been).
@@ -132,13 +133,13 @@ experts are in VRAM (8K). Quality at 128K was not measured.
 - Driver 580+ (CUDA 13)
 - RAM 16 GB+, 32 GB recommended (up to 9 GB of experts in RAM; with less, experts are read from the SSD and
   writing slows down)
-- ~20 GB free disk for IQ4_XS (10-15 GB for the smaller models)
+- ~20 GB free disk for IQ4_XS and the image encoder (10-15 GB for the smaller models)
 - Python 3.10+ (setup creates a venv and installs the server's packages into it)
 
 ## Use
 
 1. Unpack the release zip (or build, below).
-2. `setup.bat`: checks the GPU/driver/RAM/disk, downloads the model (resumable) and checks its SHA-256, creates
+2. `setup.bat`: checks the GPU/driver/RAM/disk, downloads the model (resumable) and the image encoder's weights (0.35 GB; `--vision off`: none) and checks their SHA-256, creates
    `.venv` with the server's Python packages, and writes the settings to `config\inkling.json`. At the end it prints
    estimates for the choice (usable VRAM, KV cache size, experts in VRAM) and tables of other context lengths and
    models with the speeds measured above.
@@ -156,6 +157,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | Option | |
 |---|---|
 | `setup.bat --model NAME` | `iq4_xs` (default) / `q3_k_xl` / `q2_k_xl` / `iq2_xxs` |
+| `setup.bat --vision off` | no pictures (default `cpu`: the image encoder on the CPU) |
+| `setup.bat --vision-max-tokens N` | the most tokens a picture takes (default 1,024; larger ones are scaled down) |
 | `setup.bat --context N` | context length (`64k` / `128k` / `256k` too) |
 | `setup.bat --port N` | server port |
 | `setup.bat --limit-ram-gb 16 --limit-vram-gb 8` | settings for a smaller budget |
@@ -177,7 +180,12 @@ Settings setup chooses by usable VRAM: 128K context / 2,048-token prompt batches
 - A little further from the reference at 128K: against llama.cpp, mean KLD rises from 0.0049 at 2K to 0.0075 (top-1 97.4% to
   96.9%). The reference uses fp16 KV; this engine uses q8_0.
 - With tools and thinking off, the model may still think briefly before its call.
-- No image input in this package.
+- Pictures are on by default (`setup.bat --vision off` turns them off). The image encoder runs on the CPU and takes
+  no VRAM: about 0.5 GB of RAM, started by the first picture and stopped after two idle minutes. A 640 x 400 picture
+  takes about 0.7 s and 160 tokens, 1920 x 1200 about 5.8 s and 1,000 tokens (Core Ultra 7 265K, at most 1,024
+  tokens; `--vision-max-tokens 300` brings large ones to about 1.3 s and 273 tokens). With pictures on, the experts in
+  VRAM and the writing speed stay the same (checked at 8K and 128K). OpenAI `image_url` parts (base64 or URL) and
+  Anthropic image blocks.
 
 ## Build
 
@@ -188,7 +196,8 @@ tools\build.bat            :: compute capability 7.5 / 8.6 / 8.9 / 12.0 (slow)
 tools\build.bat --native   :: this PC only
 ```
 
-Output: `build\bin` (setup finds it). `python tools\package.py --version X` writes the release zip to `dist\`.
+Output: `build\bin` (setup finds it). The image encoder (`strata-vision.exe`, CPU): `tools\build_vision.bat` with
+`LLAMA_DIR` set to a llama.cpp checkout (690b87d88 or later), into `build-vision\bin`. `python tools\package.py --version X` writes the release zip to `dist\`.
 
 ## Measuring
 

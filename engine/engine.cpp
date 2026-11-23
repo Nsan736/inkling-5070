@@ -707,6 +707,7 @@ Engine::~Engine() {
     }
     vmm_free(arena_);
     vmm_free(stage_map_);
+    if (scratch_map_.base) vmm_free(scratch_map_);   // inkling2 fork: INKLING2_WIDE_READ
     for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
@@ -736,6 +737,8 @@ void* Engine::dmalloc(size_t bytes, const char* what) {
                                  " MiB): " + cudaGetErrorString(e));
     }
     dev_allocs_.push_back(p);
+    static const bool log = std::getenv("INKLING2_ALLOC_LOG") != nullptr;   // inkling2 fork: the big ones, for sizing
+    if (log && bytes >= (size_t(8) << 20)) std::fprintf(stderr, "strata-inkling2: alloc %zu MiB %s\n", bytes >> 20, what);
     return p;
 }
 
@@ -2618,6 +2621,53 @@ void Engine::narrow_stage() {
     stage_cut_ = 0;
 }
 
+// inkling2 fork, INKLING2_WIDE_READ: scratch_'s pointers for `rows` rows (the same base, the same order)
+void Engine::carve_scratch(int rows) {
+    rows_ = rows;
+    scratch_at_ = 0;
+    shared_scratch();
+    assign_scratch();
+}
+
+// A read longer than the writing rows: scratch_ mapped and laid out for the prompt batch, the expert cache giving up
+// what the card lacks for it (its least used experts), as widen_stage() does for the staging buffer
+void Engine::widen_scratch() {
+    if (!rows_wide_ || scratch_lent_) return;
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "scratch");
+    ck(cudaStreamSynchronize(cs(st_)), "scratch");
+    const size_t want = up_to(scratch_wide_ * sizeof(float) + 256, pool_on_ ? pg_ : grain_) - scratch_map_.mapped;
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    if (pool_on_) free_b = vpool_bytes();
+    const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+    scratch_cut_ = 0;
+    if (exp_ && free_b < want + quarter) {
+        const size_t had = arena_.mapped;
+        shrink_cache(want + quarter - free_b);
+        held_is_budget();
+        scratch_cut_ = had - arena_.mapped;
+    }
+    vmm_map(scratch_map_, scratch_wide_ * sizeof(float) + 256, SIZE_MAX, "scratch");
+    scratch_lent_ = true;
+    carve_scratch(rows_wide_);
+}
+
+// The read is done: scratch_ laid out for the writing rows again (the last logits moved with it), the rest given back
+// and the expert cache taking it back
+void Engine::narrow_scratch() {
+    if (!scratch_lent_) return;
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "scratch");
+    ck(cudaStreamSynchronize(cs(st_)), "scratch");
+    float* const old_logits = logits_;
+    carve_scratch(rows_narrow_);
+    if (old_logits != logits_)
+        ck(cudaMemcpy(logits_, old_logits, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToDevice), "scratch");
+    vmm_unmap(scratch_map_, scratch_narrow_ * sizeof(float) + 256);
+    scratch_lent_ = false;
+    if (exp_ && scratch_cut_ > 0) grow_cache(scratch_cut_, true);
+    scratch_cut_ = 0;
+}
+
 // The cache's VRAM and the attention caches' as they are now become the budget cover() keeps them to.
 void Engine::held_is_budget() {
     budget_ = arena_.mapped + other_rows();
@@ -3605,10 +3655,34 @@ void Engine::alloc() {
 
     shared_scratch();   // the first pass only counts
     assign_scratch();
-    scratch_ = (float*) dmalloc(scratch_at_ * sizeof(float), "scratch");
+    // inkling2 fork, INKLING2_WIDE_READ=N: scratch_ in VMM, mapped for N rows while writing and for the prompt batch
+    // while reading (widen_scratch()), so that the expert cache holds the difference while writing
+    const char* wide = std::getenv("INKLING2_WIDE_READ");
+    const int narrow = wide ? std::atoi(wide) : 0;
+    if (vmm_ && narrow >= kStageRows && narrow < rows_ && !opt_.dump) {
+        rows_wide_ = rows_;
+        scratch_wide_ = scratch_at_;
+        rows_ = narrow;
+        scratch_at_ = 0;
+        shared_scratch();
+        assign_scratch();
+        rows_narrow_ = narrow;
+        scratch_narrow_ = scratch_at_;
+        rows_ = rows_wide_;
+        vmm_reserve(scratch_map_, scratch_wide_ * sizeof(float) + 256);
+        vmm_map(scratch_map_, scratch_narrow_ * sizeof(float) + 256, SIZE_MAX, "scratch");
+        scratch_ = (float*) scratch_map_.base;
+        std::fprintf(stderr, "strata-inkling2: wide reads: scratch %zu MiB while writing (%d rows), %zu MiB while "
+                             "reading (%d rows)\n", (scratch_narrow_ * sizeof(float)) >> 20, rows_narrow_,
+                     (scratch_wide_ * sizeof(float)) >> 20, rows_wide_);
+    } else {
+        scratch_ = (float*) dmalloc(scratch_at_ * sizeof(float), "scratch");
+    }
     scratch_at_ = 0;
+    if (rows_narrow_) rows_ = rows_narrow_;
     shared_scratch();
     assign_scratch();
+    rows_ = rows_wide_ ? rows_wide_ : rows_;   // the rest of alloc() sizes for the prompt batch
 
     const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
     xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
@@ -4984,6 +5058,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
 #endif
             if (tl && !tl_launched) ck(cudaEventRecord((cudaEvent_t) tl_ev_[1], cs(st_)), "timeline");
             tl_launched = true;
+            if (kick_ & 2) (void) cudaStreamQuery(cs(st_));   // inkling2 fork, INKLING2_KICK: to the card now (WDDM)
         };
 
         // The next layer's router wait is what makes h_cpu_ free to write again.
@@ -6590,6 +6665,7 @@ void Engine::layer(int il, int n) {
     } else {
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         moe_shared(L, il, n);
+        if (kick_ & 1) (void) cudaStreamQuery(cs(st_));   // inkling2 fork, INKLING2_KICK
         if (moe(il, n)) moe_add(n);
     }
     if (pt) {
@@ -6608,6 +6684,7 @@ void Engine::layer(int il, int n) {
         pt0 = Clock::now();
     }
     layer_tail(L, il, n);
+    if ((kick_ & 4) && n <= kCpuRows) (void) cudaStreamQuery(cs(st_));   // inkling2 fork, INKLING2_KICK
     if (pt) {
         pt_wait();
         stats_.pt_tail_ms += ms_since(pt0);
@@ -6645,6 +6722,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         if (marks[k].at <= (k ? marks[k - 1].at : 0) || marks[k].at >= n)
             throw std::logic_error("read: the marks rise, above 0 and below the tokens read");
 
+    if (rows_wide_ && n > rows_narrow_) widen_scratch();   // inkling2 fork: INKLING2_WIDE_READ
     // the calls: up to max_rows() tokens each, and none across a mark
     calls_.clear();
     for (int at = 0, k = 0; at < n;) {

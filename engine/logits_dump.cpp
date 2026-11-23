@@ -170,7 +170,19 @@ int main(int argc, char** argv) {
             e->images(at.data(), (int) at.size());
             for (const auto& im : at) std::fprintf(stderr, "picture: %d rows at %lld\n", im.n, (long long) im.at);
         }
-        for (size_t i = 0; i < prompt.size();) {
+        // inkling2 fork, INKLING2_DUMP_READ=1: the prompt as the server reads it - read() up to its last token,
+        // end_read(), then the last token by eval() - so that what read() does (INKLING2_WIDE_READ) is in the logits
+        static const bool as_server = std::getenv("INKLING2_DUMP_READ") != nullptr;
+        if (as_server && prompt.size() > 1) {
+            for (size_t i = 0; i + 1 < prompt.size();) {
+                const int m = (int) std::min(prompt.size() - 1 - i, (size_t) e->max_read());
+                if (!e->read(prompt.data() + i, m)) throw std::runtime_error("read gave up");
+                i += (size_t) m;
+            }
+            e->end_read();
+            e->eval(prompt.data() + prompt.size() - 1, 1, true);
+        }
+        for (size_t i = as_server && prompt.size() > 1 ? prompt.size() : 0; i < prompt.size();) {
             const int m = (int) e->whole((int64_t) i, (int64_t) std::min(prompt.size() - i, (size_t) e->max_rows()));
             e->eval(prompt.data() + i, m, i + (size_t) m == prompt.size());
             i += (size_t) m;

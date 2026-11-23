@@ -5,11 +5,12 @@
 > **非公式です。** [Strata](https://github.com/Niko1221/Strata) と [PolyStrata](https://github.com/simplexai-labs/PolyStrata)
 > をもとにした独立のフォークで、どちらのプロジェクトの一部でもなく、作者によるサポートもありません。
 
-> **確認の状況（0.2.0）**
+> **確認の状況（0.3.0）**
 > - 既定の IQ4_XS の品質は llama.cpp（IQ4_XS、KV fp16）のロジットと照合しました。2K の文脈で KLD 平均 0.0049、
 >   上位 1 位の一致 97.4%、128K の文脈で KLD 平均 0.0075、上位 1 位の一致 96.9% です。
 > - Unsloth の Q8_K_XL（llama.cpp）を基準にすると、2K で KLD 平均 0.0026、上位 1 位の一致 98.4% です。
 > - 小さいモデル（Q3_K_XL / Q2_K_XL / IQ2_XXS）の品質は 2K だけで確かめました。
+> - 画像入力は、写真・スクリーンショット・図の 3 枚で内容を正しく説明できることを確かめました（ベンチマークはしていません）。
 > - 動作を確かめたのは 1 台の PC（RTX 5070 / Windows 11）だけです。8 GB と 6 GB の値は、この RTX 5070 の VRAM を
 >   制限して測ったもので、実際の 8 GB / 6 GB のカードでは確かめていません。
 > - setup のモデルのダウンロードは、最初から最後までの通しではまだ試していません（SHA-256 の確認は動作を確かめ済み）。
@@ -138,7 +139,7 @@ NVIDIA の GPU 1 枚と PC のメモリで動かすエンジンです。
 | GPU | NVIDIA、compute capability 7.5 以上（RTX 20〜50）、VRAM 8 GB 以上（6 GB は VRAM を制限した計測のみ） |
 | ドライバー | 580 以降（CUDA 13） |
 | RAM | 16 GB 以上、32 GB 推奨 |
-| ディスク | 空き 約 20 GB（IQ4_XS。小さいモデルは 10〜15 GB） |
+| ディスク | 空き 約 20 GB（IQ4_XS と画像のエンコーダー。小さいモデルは 10〜15 GB） |
 | Python | 3.10 以降 |
 
 - **GPU:** ビルドの対象は 7.5、8.6、8.9、12.0 と、それより新しい世代向けの PTX です。
@@ -151,6 +152,7 @@ NVIDIA の GPU 1 枚と PC のメモリで動かすエンジンです。
 2. `setup.bat` を実行します。
    - GPU、ドライバー、RAM、ディスクを確かめます。
    - モデルを取得し（途中から再開できます）、SHA-256 を確かめます。
+   - 画像入力のエンコーダーの重み（0.35 GB）を取得します（`--vision off` で画像入力なし）。
    - `.venv` を作り、サーバーの Python パッケージを入れます。
    - 設定を `config\inkling.json` に書きます。
    - 最後に、使える VRAM、KV の大きさ、VRAM に入るエキスパートの数の見積もりと、ほかの文脈の長さ・モデルとの
@@ -170,6 +172,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | オプション | 内容 |
 |---|---|
 | `setup.bat --model NAME` | `iq4_xs`（既定）/ `q3_k_xl` / `q2_k_xl` / `iq2_xxs` |
+| `setup.bat --vision off` | 画像入力を使わない（既定は `cpu`: CPU で画像をエンコード） |
+| `setup.bat --vision-max-tokens N` | 画像 1 枚のトークン数の上限（既定 1,024。大きい画像は縮小） |
 | `setup.bat --context N` | 文脈の長さ（`64k` / `128k` / `256k` の書き方も可） |
 | `setup.bat --port N` | サーバーのポート |
 | `setup.bat --limit-ram-gb 16 --limit-vram-gb 8` | 小さな予算向けの設定 |
@@ -199,7 +203,12 @@ setup が選ぶ設定（使える VRAM による）:
 - **128K では参照とのずれが少し大きくなります。** llama.cpp との照合で、KLD 平均が 2K の 0.0049 から 0.0075 に上がります
   （上位 1 位の一致は 97.4% から 96.9%）。参照の KV は fp16、このエンジンは q8_0 です。
 - **ツールを渡して思考をオフにしたとき**も、モデルが短く考えてからツールを呼ぶことがあります。
-- **画像入力:** この配布物では使えません。
+- **画像入力:** 既定で使えます（`setup.bat --vision off` で外せます）。
+  - 画像のエンコーダーは CPU で動き、VRAM を使いません。RAM は約 0.5 GB で、画像が来たときだけ起動し、2 分使われないと止まります。
+  - 1 枚あたり、640 x 400 で約 0.7 秒・160 トークン、1920 x 1200 で約 5.8 秒・1,000 トークンです（Core Ultra 7 265K、
+    上限 1,024 トークン）。`--vision-max-tokens 300` なら、大きな画像も約 1.3 秒・273 トークンになります。
+  - 画像入力を有効にしても、VRAM のエキスパートの数と生成の速さは変わりません（8K・128K で確認）。
+  - OpenAI の `image_url`（base64 / URL）と Anthropic の画像ブロックが使えます。
 
 ## ビルド
 
@@ -214,6 +223,9 @@ tools\build.bat --native   :: この PC 専用
 ```
 
 - できたものは `build\bin` に入ります。setup はそこを見つけて使います。
+- 画像のエンコーダー（`strata-vision.exe`、CPU 用）は `tools\build_vision.bat` でビルドします。llama.cpp のソース
+  （690b87d88 以降）を `LLAMA_DIR` で指定します（`set LLAMA_DIR=C:\src\llama.cpp`）。できたものは `build-vision\bin`
+  に入ります。
 - `python tools\package.py --version X` で、配布 zip が `dist\` にできます。
 
 ## 計測
