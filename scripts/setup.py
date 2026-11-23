@@ -351,6 +351,10 @@ def main():
                          "1200 on a Core Ultra 7 265K; off: text only")
     ap.add_argument("--vision-max-tokens", type=int, default=1024,
                     help="the most tokens a picture takes (a larger one is scaled down first); default 1024")
+    ap.add_argument("--thinking", choices=("low", "medium", "high"), default="medium",
+                    help="the thinking level for requests that do not send one (reasoning_effort); default medium. "
+                         "With high the model often drafts whole files in its thinking and an agent's reply reaches "
+                         "max_tokens; a request's own reasoning_effort still wins")
     ap.add_argument("--context", type=context_arg, default=0,
                     help="the context length instead of the chosen one: tokens, or 64k / 128k / 256k")
     ap.add_argument("--gpu", type=int, default=0, help="which NVIDIA GPU (nvidia-smi's index)")
@@ -461,6 +465,7 @@ def main():
                 chosen[key] = val
     for k, v in chosen.items():
         say(f"  {k}: {v}")
+    say(f"  thinking: {a.thinking} (for requests that send no reasoning_effort)")
     expect(a.model, g, min(vram_limit, g["vram_mib"]), chosen)
     cfg_path = Path(a.config)
     old = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
@@ -469,7 +474,7 @@ def main():
            "model_name": "inkling-2-mini", "display_name": m["display"], "model_choice": a.model,
            "args": ["--model", str(model)] + args,
            "host": "127.0.0.1", "port": port, "log": str(ROOT / "logs" / "engine.log"),
-           "sampling": {"temperature": 1.0}, "chosen": chosen,
+           "sampling": {"temperature": 1.0}, "reasoning_effort": a.thinking, "chosen": chosen,
            "limits": {"ram_gb": a.limit_ram_gb, "vram_gb": a.limit_vram_gb}}
     if a.gpu:
         cfg["gpu"], cfg["gpus_asked"] = a.gpu, True   # the server tells the engine this card

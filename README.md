@@ -5,7 +5,7 @@
 > **非公式です。** [Strata](https://github.com/Niko1221/Strata) と [PolyStrata](https://github.com/simplexai-labs/PolyStrata)
 > をもとにした独立のフォークで、どちらのプロジェクトの一部でもなく、作者によるサポートもありません。
 
-> **確認の状況（0.3.0）**
+> **確認の状況（0.3.1）**
 > - 既定の IQ4_XS の品質は llama.cpp（IQ4_XS、KV fp16）のロジットと照合しました。2K の文脈で KLD 平均 0.0049、
 >   上位 1 位の一致 97.4%、128K の文脈で KLD 平均 0.0075、上位 1 位の一致 96.9% です。
 > - Unsloth の Q8_K_XL（llama.cpp）を基準にすると、2K で KLD 平均 0.0026、上位 1 位の一致 98.4% です。
@@ -168,12 +168,16 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 - `"reasoning_effort": "none"`（または `"chat_template_kwargs": {"enable_thinking": false}`）で、考えずにすぐ答えます。
+- 依頼が思考レベルを送らないときは `medium` で考えます（`setup.bat --thinking`）。
+  エージェントでファイルを書く使い方では `medium` 以下を推奨します。
+  `high` は思考の中でファイルの下書きを書くことが多く、`max_tokens` に達しやすくなります。
 
 | オプション | 内容 |
 |---|---|
 | `setup.bat --model NAME` | `iq4_xs`（既定）/ `q3_k_xl` / `q2_k_xl` / `iq2_xxs` |
 | `setup.bat --vision off` | 画像入力を使わない（既定は `cpu`: CPU で画像をエンコード） |
 | `setup.bat --vision-max-tokens N` | 画像 1 枚のトークン数の上限（既定 1,024。大きい画像は縮小） |
+| `setup.bat --thinking LEVEL` | 思考レベルを送らない依頼の思考レベル: `low` / `medium`（既定）/ `high` |
 | `setup.bat --context N` | 文脈の長さ（`64k` / `128k` / `256k` の書き方も可） |
 | `setup.bat --port N` | サーバーのポート |
 | `setup.bat --limit-ram-gb 16 --limit-vram-gb 8` | 小さな予算向けの設定 |

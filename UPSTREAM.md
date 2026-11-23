@@ -47,4 +47,12 @@ environment variable is set.
 ## Server
 
 PolyStrata's server checks the engine's file name to know which commands it has; `strata-inkling2` is added to
-those checks (two lines of `server/serve/server.py`). Nothing else is changed.
+those checks (two lines of `server/serve/server.py`). The other changes:
+
+- 0.2.0: with thinking off, the prompt opens the reply's text block (an empty thinking block with tools), after
+  Strata's #6612 / #6627.
+- 0.3.1: with tools, the thinking closed early to leave room for the answer leaves it half of `max_tokens` (a
+  quarter without tools, as before); a tool call cut off by `max_tokens` sends the arguments written so far, with
+  `finish_reason` `length` (they were sent empty); one line per request with the sampling the client sent and the
+  one used, the thinking level and the limits, on the screen and in the engine log (`STRATA_LOG_SAMPLING=0` turns
+  it off).

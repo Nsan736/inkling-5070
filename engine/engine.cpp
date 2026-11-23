@@ -3656,9 +3656,13 @@ void Engine::alloc() {
     shared_scratch();   // the first pass only counts
     assign_scratch();
     // inkling2 fork, INKLING2_WIDE_READ=N: scratch_ in VMM, mapped for N rows while writing and for the prompt batch
-    // while reading (widen_scratch()), so that the expert cache holds the difference while writing
-    const char* wide = std::getenv("INKLING2_WIDE_READ");
-    const int narrow = wide ? std::atoi(wide) : 0;
+    // while reading (widen_scratch()), so that the expert cache holds the difference while writing.  Turned off for
+    // now: rows_ stays the prompt batch after alloc(), so an eval() of more than N tokens (a picture's prompt, the
+    // logits dump) writes past the narrow layout.  The setting is ignored with a warning until that is fixed.
+    if (const char* wide = std::getenv("INKLING2_WIDE_READ"); wide && std::atoi(wide) != 0)
+        std::fprintf(stderr, "strata-inkling2: INKLING2_WIDE_READ=%s is ignored (turned off until its eval() path is "
+                             "fixed)\n", wide);
+    const int narrow = 0;
     if (vmm_ && narrow >= kStageRows && narrow < rows_ && !opt_.dump) {
         rows_wide_ = rows_;
         scratch_wide_ = scratch_at_;

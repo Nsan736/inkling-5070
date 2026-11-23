@@ -1892,6 +1892,13 @@ def inkling_call_end(text: str) -> int:
     return -1
 
 
+def inkling_partial_args(body: str) -> str:
+    """inkling2 fork: the unfinished arguments of an unfinished call block `{"name":NAME,"args":{...` - the text after
+    its "args" (or "arguments") key, else the body as it is."""
+    m = re.match(r'\s*\{\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"(?:args|arguments)"\s*:\s*', body)
+    return body[m.end():] if m else body
+
+
 def parse_inkling_tool_call(name: str, body: str) -> ToolCall | None:
     """A call block's body, `{"name":NAME,"args":{...}}`, -> its call; None when it is not one.  The name is the
     header's (llama.cpp's grammar makes the two the same).  A body with no "args" is the arguments alone, less the
@@ -2055,6 +2062,11 @@ class InklingParser:
         elif self.mode == "call":
             if parse_inkling_tool_call(self.name, buf) is not None or self.scall is None:
                 out += self._finish_call(buf)
+            elif reason == "length" and buf:
+                # inkling2 fork: a call cut off by max_tokens keeps the arguments written so far (the JSON as far as
+                # it got, after the block's "args" key), sent as the call's argument text with no "tool_call": the
+                # reply ends "length" and the client sees how far the call got instead of empty arguments
+                out.append(Event("tool_args", inkling_partial_args(buf), call=self.scall))
             self.name, self.scall = None, None
         elif self.mode == "head":
             rest = buf[len(INK_HEADER):]

@@ -175,6 +175,14 @@ REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 
 
+def answer_reserve(max_new: int, tools) -> int:
+    """The tokens of max_tokens kept for the answer after the thinking is closed: a quarter (at least
+    ANSWER_RESERVE_MIN, at most half), and with tools (inkling2 fork) half."""
+    if tools:
+        return max_new // 2
+    return min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+
+
 def closed_with(text: str, think_end: str) -> str:
     """REASONING_CLOSE or REASONING_WRAP_UP for a model whose thinking ends with think_end (OutputParser).  Gemma 4
     ends it with <channel|>, its answer right after: a </think> there is text inside the thought, and the model
@@ -4528,6 +4536,8 @@ class Service:
                 kwargs["reasoning_effort"] = "none"
             elif effort not in (None, ""):
                 kwargs["reasoning_effort"] = INKLING_EFFORT.get(effort, effort)
+            # inkling2 fork: the level the template gets, for the sampling line (log_sampling) (none sent: its own "high")
+            self.last_effort = kwargs.get("reasoning_effort") or "high (template default)"
             prompt = self.template.render(messages, tools=tools, **kwargs)
             if off or kwargs.get("reasoning_effort") == "none":
                 # inkling2 fork (Strata's #6612 / #6627): the template ends on a closed block, and with its effort
@@ -4948,6 +4958,7 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
+        client_sampling = dict(sampling or {})         # inkling2 fork: what the request itself sent (log_sampling)
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
@@ -4967,17 +4978,21 @@ class Service:
             # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
             # A request with a budget of its own, or one that asked for fewer than ANSWER_ROOM_MIN_CAP tokens, is left
             # as it was.
-            budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            # inkling2 fork: a request with tools keeps half for the answer (a file written by a call is often 9,000 to
+            # 11,000 tokens, more than a quarter of 16384); one without tools keeps its quarter as before
+            budget = max_new - answer_reserve(max_new, tools)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
-            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            reserve = answer_reserve(max_new, tools)
             if budget > max_new - reserve:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
+        if os.environ.get("STRATA_LOG_SAMPLING", "1") != "0":
+            log_sampling(self, client_sampling, sampling, thinking, max_new, budget)
         opened = bool(self.think_open_ids) and ids[-len(self.think_open_ids):] == self.think_open_ids
         parser = (InklingParser if self.call_format == "inkling" else OutputParser)(
             thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
@@ -7819,6 +7834,31 @@ MODEL_CARD_SAMPLING = {
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
 }
+
+
+SAMPLING_LOG_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                     "repetition_penalty", "penalty_last_n", "seed")
+
+
+def log_sampling(svc, client, used, thinking, max_new, budget) -> None:
+    """inkling2 fork, on by default (STRATA_LOG_SAMPLING=0 turns it off): one line per request with the sampling the
+    client sent, the sampling the engine gets after the config's defaults, the thinking level and the limits, printed
+    and appended to the engine log (beside the engine's own line for the same request)."""
+    def fmt(d):
+        return " ".join(f"{k}={d[k]!r}" for k in SAMPLING_LOG_KEYS if d.get(k) is not None) or "(none)"
+    effort = getattr(svc, "last_effort", None) if thinking else "none"
+    line = (f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} sampling: client {fmt(client)}; used {fmt(used or {})}; "
+            f"thinking {effort}; max_tokens {max_new}; thinking closed at {budget or '-'}")
+    print(line, flush=True)
+    # through the handle the engine's stderr shares (as the "engine started" line): a second handle opened on the log
+    # writes at its own position on Windows, and the engine's next lines wrote over it
+    log = getattr(svc.engine, "log", None)
+    if hasattr(log, "write") and not getattr(log, "closed", True):
+        try:
+            log.write(line + "\n")
+            log.flush()
+        except (OSError, ValueError):
+            pass
 
 
 def model_card_sampling(arch, thinking) -> dict:

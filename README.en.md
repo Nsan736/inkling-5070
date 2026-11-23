@@ -6,7 +6,7 @@
 > [PolyStrata](https://github.com/simplexai-labs/PolyStrata); it is not part of either project and is not supported
 > by their authors.
 
-> **Status (0.3.0)**
+> **Status (0.3.1)**
 > - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0049, top-1 agreement 97.4% at a 2K
 >   context; mean KLD 0.0075, top-1 96.9% at a 128K context.
 > - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0026, top-1 98.4%.
@@ -153,12 +153,15 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 `"reasoning_effort": "none"` (or `"chat_template_kwargs": {"enable_thinking": false}`) answers without thinking.
+A request that sends no thinking level thinks at `medium` (`setup.bat --thinking`). For an agent that writes files,
+`medium` or lower is recommended: at `high` the model often drafts the files in its thinking and reaches `max_tokens`.
 
 | Option | |
 |---|---|
 | `setup.bat --model NAME` | `iq4_xs` (default) / `q3_k_xl` / `q2_k_xl` / `iq2_xxs` |
 | `setup.bat --vision off` | no pictures (default `cpu`: the image encoder on the CPU) |
 | `setup.bat --vision-max-tokens N` | the most tokens a picture takes (default 1,024; larger ones are scaled down) |
+| `setup.bat --thinking LEVEL` | the thinking level of requests that send none: `low` / `medium` (default) / `high` |
 | `setup.bat --context N` | context length (`64k` / `128k` / `256k` too) |
 | `setup.bat --port N` | server port |
 | `setup.bat --limit-ram-gb 16 --limit-vram-gb 8` | settings for a smaller budget |
