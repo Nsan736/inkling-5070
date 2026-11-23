@@ -17,7 +17,11 @@ if not defined VS (
   echo ERROR: Visual Studio with the C++ tools was not found
   exit /b 1
 )
-rem cl's /showIncludes in English, so that Ninja records the header dependencies
+rem The header dependencies: Ninja reads cl's /showIncludes lines by the prefix the configure saw, and cl writes them
+rem in the console's code page (a Japanese cl: cp932 under 932, UTF-8 under 65001).  A build under another code page
+rem than its configure records no headers, and a changed header rebuilds nothing.  So the code page is UTF-8 for
+rem both, and tools\ninja_deps_check.py repairs a build directory configured under another one.
+chcp 65001 >nul
 set VSLANG=1033
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 if not defined JOBS set JOBS=12
@@ -27,6 +31,7 @@ if /i "%~1"=="--native" (
   set "BDIR=build-native"
   set "OPTS=-DINK_NATIVE=ON -DCMAKE_CUDA_ARCHITECTURES=native"
 )
+where python >nul 2>nul && python -I tools\ninja_deps_check.py "%BDIR%"
 if not exist "%BDIR%\build.ninja" (
   cmake -S . -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release %OPTS% || exit /b 2
 )
