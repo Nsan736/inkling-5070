@@ -7,8 +7,9 @@
 > by their authors.
 
 > **Status (0.1.0)**
-> - Quality was checked at a 2K context only (against llama.cpp's logits: mean KLD 0.0049, top-1 agreement 97.4%).
-> - Quality at long (128K) contexts has not been checked yet.
+> - Quality against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0049, top-1 agreement 97.4% at a 2K context;
+>   mean KLD 0.0075, top-1 96.9% at a 128K context.
+> - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0026, top-1 98.4%.
 > - setup's model download has not been tried end to end yet (the SHA-256 check has been).
 > - Tested on one PC only (RTX 5070 / Windows 11).
 
@@ -47,7 +48,10 @@ One request; 200 tokens after the first 16. 128K = a 120K-token code context plu
 - NInfer: `--expert-residency host --host-cache-mib 1024 --spec none`, MXFP8 KV, same tokens. Its top_k is capped
   at 20 (this engine samples from the whole vocabulary). Its docs report 83.5 tok/s on an RTX 5070 under Linux;
   on Windows it disables CUDA graphs for this model. [docs/ninfer_comparison.md](docs/ninfer_comparison.md)
-- Against llama.cpp's logits (fp16 KV), 2,048 tokens: mean KLD 0.0049, top-1 97.4%.
+- Against llama.cpp's logits (IQ4_XS, fp16 KV; this engine's KV is q8_0):
+  - 2K (2,048 tokens): mean KLD 0.0049, top-1 97.4%
+  - 128K (the last 1,023 positions of a 124,928-token context): mean KLD 0.0075, top-1 96.9%
+  - Against Q8_K_XL at 2K: mean KLD 0.0026, top-1 98.4%
 - More: [docs/measurements.md](docs/measurements.md)
 
 ## Requirements
@@ -92,7 +96,8 @@ Settings setup chooses by usable VRAM: 128K context / 2,048-token prompt batches
 - 7-8 CPU cores busy while writing (the expert threads spin between layers; idle between requests).
 - ~12 GB of RAM for the engine with the default 9 GB expert budget, plus the OS file cache.
 - Tested on Windows, on one PC.
-- Quality was checked at a 2K context only; not yet at 128K (see Status at the top).
+- A little further from the reference at 128K: against llama.cpp, mean KLD rises from 0.0049 at 2K to 0.0075 (top-1 97.4% to
+  96.9%). The reference uses fp16 KV; this engine uses q8_0.
 - No image input in this package.
 
 ## Build
