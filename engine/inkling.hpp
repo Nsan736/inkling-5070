@@ -107,7 +107,11 @@ private:
         uint8_t* plane[4] = {};
     };
 
-    bool q8() const { return opt_.kv_format == KvFmt::kQ8_0; }
+    /// Q8_0 keys (q8_0, and k8v4's); inkling2 fork: v4() - k8v4's 4-bit values, rotated with wht()
+    bool q8() const { return opt_.kv_format == KvFmt::kQ8_0 || v4(); }
+    bool v4() const { return opt_.kv_format == KvFmt::kK8V4 || opt_.kv_format == KvFmt::kK8V4Plain; }
+    bool wht() const { return opt_.kv_format == KvFmt::kK8V4; }
+    int vbits() const { return v4() ? (wht() ? 5 : 4) : 8; }   ///< kv_dst()'s and attn_seq()'s: 5 is 4 rotated
     int planes() const { return q8() ? 4 : 2; }
     size_t plane_row(int i) const;   ///< a row's bytes in plane i
     int phys_of(int v) const;

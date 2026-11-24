@@ -23,8 +23,7 @@ environment variable is set.
   on Windows the copy engine's start delayed every layer (+13% at 8K).
 - The CPU expert threads spin longer before sleeping (`INKLING2_SPIN`, default 200,000): +5% at 8K and 128K, with
   3 to 4 more cores busy while it writes.
-- Opt-in: an AVX-VNNI NVFP4 dot product for the CPU experts that matches ggml's bit for bit (`INKLING2_CPU_VNNI`),
-  one synchronization per CPU expert call (`INKLING2_CPU_FUSED`), routing on the GPU with only the misses sent to
+- Opt-in: one synchronization per CPU expert call (`INKLING2_CPU_FUSED`), routing on the GPU with only the misses sent to
   the host (`INKLING2_CARD_SPLIT`, `INKLING2_CARD_PIPE`), the DSpark drafter (`INKLING2_DSPARK`), a pinned expert
   pool, merged CUDA graphs, flag waits and timing reports (`INKLING2_TIMELINE`, `INKLING2_PREFILL_TIMES`,
   `INKLING2_REPORT_CACHE`).
@@ -41,6 +40,24 @@ environment variable is set.
   left out and the hit rate in the per-answer cache line, the skip options in `inkling2_logits_dump`, and
   `INKLING2_ZERO_ORDER` (opt-in: the order of the experts no token has used yet when the cache is filled; the idea of
   favoring the loop's layers is kuraneko1/Strata's, MIT, no code taken; measured slower, so the default is unchanged).
+- 0.3.2 (each the same bits as before unless noted; speeds measured warm, after one answer in the same engine):
+  - The prompt attention's codes to halves without int-to-float conversions (`INKLING2_ATTN_CVT=0` turns it off):
+    256K read +2-3%.
+  - A read's token embeddings on the CPU threads (`INKLING2_EMBED_MT=0` off).
+  - A long prompt is read in fewer passes (`--read-mib`, by default by the machine's RAM: 2048 MiB with 30 GiB or
+    more, 1024 with 15, else 512, at most a quarter of what is free), so the experts outside VRAM are copied to the
+    card fewer times; setup writes it.  The idea of staging only the experts VRAM lacks follows kuraneko1/Strata (MIT).
+  - A prompt batch's F32 products with 64 or fewer outputs (the loop's gates) by the tiled kernel
+    (`INKLING2_GEMM_TILE=0` off). With the two above: 4K / 32K / 64K reads +5% / +9% / +11%.
+  - The CPU experts' AVX-VNNI NVFP4 dot product by default on a CPU with AVX-VNNI (`INKLING2_CPU_VNNI=0` off; it
+    matches ggml's bit for bit): 64K writing +8-12%.
+  - `--window` up to 64 (default still 8); per-window-size tables that were written past their end from 9 tokens on
+    are sized for it.
+  - Opt-in: `--kv k8v4` (8-bit keys, 4-bit values with a per-32 Walsh-Hadamard rotation; the ideas of NInfer's
+    `rk8v4` (Apache-2.0) and TurboQuant (MIT), no code taken): more experts in VRAM at 256K (673 -> 927) and
+    writing +18% there, quality at 128K a little past this project's bar (KLD 0.0075 -> 0.0124).
+  - Measurement switches: `INKLING2_VISIT_TRACE` (a written token's visits stamped on the card and the host),
+    `inkling2_cpu_calls`, `INKLING2_READ_MIB`.
 - `inkling2_logits_dump`, `inkling2_cpu_bandwidth` and `inkling2_pcie_bandwidth` for the quality checks and
   measurements.
 

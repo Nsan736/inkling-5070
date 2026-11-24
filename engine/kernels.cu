@@ -2717,7 +2717,15 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
     if (groups == 1 && n_out <= 8 * SMALL_OUT) {
         cudaStream_t stream = nullptr;
         blas_ck(cublasGetStream(h, &stream), "cublasGetStream");
-        if (n_out > 2 * SMALL_OUT)
+        // inkling2 fork: a prompt batch's product with 64 or fewer outputs (the loop gates' 4,608 to 64) by the tiles
+        // too, where gemm_small_kernel's value from shared memory serves one product and here four: a 32K prompt read in
+        // 13.1 s against 13.9 (RTX 5070); each output the same fmaf chain in the inputs' order, the same bits.  A few rows (a
+        // written token's) keep gemm_small_kernel's blocks.  INKLING2_GEMM_TILE=0: gemm_small_kernel as before.
+        static const bool tile_few = [] {
+            const char* v = std::getenv("INKLING2_GEMM_TILE");
+            return !v || std::atoi(v) != 0;
+        }();
+        if (n_out > 2 * SMALL_OUT || (tile_few && rows >= 256))
             gemm_tile_kernel<<<dim3((rows + TILE_TOK - 1) / TILE_TOK, (n_out + TILE_OUT - 1) / TILE_OUT),
                                TILE_TOK * TILE_OUT / 16, 0, stream>>>(w, x, y, n_in, n_out, rows);
         else

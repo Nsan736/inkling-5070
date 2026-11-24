@@ -273,10 +273,38 @@ struct AttnArgs {
     float* work;
 };
 
-template <bool Q8>
+// inkling2 fork, --kv k8v4: a cache's values are fp16 (Q 0), Q8_0 (1) or 4-bit codes (2: Kvq8::bits 4, two a byte).
+// Each 32-value block of the 4-bit values may have been rotated before it was quantized (Kvq8::wht): signs, then
+// the Walsh-Hadamard transform scaled by 1/sqrt(32) (TurboQuant's random rotation before a scalar quantizer, here a
+// block's own: the rotation is the quantizer's block, so a block's outlier spreads over its 32 values and nothing
+// else).  The rotation is orthogonal, so the attention's output, a sum of rotated values, is turned back the same
+// way (wht_back()) before anything reads it.
+constexpr unsigned kWhtSigns = 0x9e3779b9u;   // value j of a block is negated where bit j is set
+
+// H x / sqrt(32) of a block held a value a lane (all 32 lanes of the warp take part)
+__device__ __forceinline__ float wht32(float x, int lane) {
+#pragma unroll
+    for (int o = 1; o < WARP; o <<= 1) {
+        const float y = __shfl_xor_sync(0xffffffffu, x, o, WARP);
+        x = (lane & o) ? __fsub_rn(y, x) : __fadd_rn(x, y);
+    }
+    return x * 0.17677669529663687f;
+}
+__device__ __forceinline__ float wht_sign(int lane) { return (kWhtSigns >> lane) & 1u ? -1.0f : 1.0f; }
+// the rotation (before the store) and its inverse (the output)
+__device__ __forceinline__ float wht_to(float x, int lane) { return wht32(x * wht_sign(lane), lane); }
+__device__ __forceinline__ float wht_back(float x, int lane) { return wht32(x, lane) * wht_sign(lane); }
+
+template <int Q>
 __device__ __forceinline__ float cache_value(const half* c, const Kvq8& q8, size_t i) {
-    if constexpr (Q8) return (float) q8.codes[i] * __half2float(__ushort_as_half(q8.scales[i / 32]));
-    else return __half2float(c[i]);
+    if constexpr (Q == 2) {
+        const unsigned b = reinterpret_cast<const uint8_t*>(q8.codes)[i / 2];
+        return (float) (int((i & 1) ? b >> 4 : b & 15u) - 8) * __half2float(__ushort_as_half(q8.scales[i / 32]));
+    } else if constexpr (Q) {
+        return (float) q8.codes[i] * __half2float(__ushort_as_half(q8.scales[i / 32]));
+    } else {
+        return __half2float(c[i]);
+    }
 }
 
 constexpr size_t attn_smem(int tq) {
@@ -289,7 +317,7 @@ constexpr size_t attn_smem(int tq) {
 // the tokens' keys.  The keys go in tiles of AT_KEYS counted from position 0; a row's online softmax only takes
 // the keys the row attends, so a key the row does not see changes nothing (its weight is exactly 0 and the row's
 // max stays).
-template <int TQ, bool KQ8, bool VQ8>
+template <int TQ, bool KQ8, int VQ8>
 __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
     constexpr int R = TQ * AT_PER;
     constexpr int RPT = (R * AT_KEYS + AT_THREADS - 1) / AT_THREADS;   // scores a thread per tile
@@ -417,7 +445,10 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
         const float mx = fmaxf(m, sink);
         const float f = m == -INFINITY ? 0.0f : expf(m - mx);
         const float denom = l * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
-        a.out[(tok * a.n_head + h) * AT_DIM + tid] = acc[r] * f / denom;
+        float y = acc[r] * f / denom;
+        if constexpr (VQ8 == 2)
+            if (a.vq.wht) y = wht_back(y, lane);
+        a.out[(tok * a.n_head + h) * AT_DIM + tid] = y;
     }
 }
 
@@ -460,7 +491,8 @@ inline int rows_from(const AttnSeqs& s, const AttnArgs&, int ntok, int from) {
 template <class Rows>
 __global__ void attn_join_kernel(AttnArgs a, Rows rows) {
     const int th = blockIdx.x, d = threadIdx.x;
-    const int nslot = rows.row(a, th / a.n_head).nslot;
+    const AttnRow row = rows.row(a, th / a.n_head);
+    const int nslot = row.nslot;
     if (nslot <= 1) return;
     const float* sinks = a.sinks;
     const float* w = a.work + size_t(th) * a.nslot * (AT_DIM + 2);
@@ -475,7 +507,9 @@ __global__ void attn_join_kernel(AttnArgs a, Rows rows) {
         sum += ws[2 + d] * f;
     }
     const size_t i = size_t(th) * AT_DIM + d;
-    const float o = sum / denom, y = a.gate ? o * sigmoidf(a.gate[i]) : o;
+    float o = sum / denom;
+    if (row.vq.wht) o = wht_back(o, d % WARP);   // inkling2 fork, --kv k8v4
+    const float y = a.gate ? o * sigmoidf(a.gate[i]) : o;
     a.out[i] = y;
     if (a.out_q8_1) fm::q8_1(y, static_cast<fm::Q81*>(a.out_q8_1) + i / 32);
 }
@@ -495,9 +529,14 @@ static_assert(DEC_WARPS * WARP == AT_DIM, "attn_dec_kernel's merge takes a threa
 static_assert(AT_MAX_REL <= WARP, "a share has one bias weight at most");
 
 // Four values of a cache from value i: Q8_0 codes times their block's scale, or halves.
-template <bool Q8>
+template <int Q8>
 __device__ __forceinline__ void load4(const half* c, const Kvq8& q8, size_t i, float* x) {
-    if constexpr (Q8) {
+    if constexpr (Q8 == 2) {   // inkling2 fork, --kv k8v4: four 4-bit codes, two bytes
+        const unsigned codes = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(q8.codes) + i / 2);
+        const float d = __half2float(__ushort_as_half(q8.scales[i / 32]));
+#pragma unroll
+        for (int j = 0; j < 4; ++j) x[j] = (float) (int((codes >> (4 * j)) & 15u) - 8) * d;
+    } else if constexpr (Q8) {
         const int codes = *reinterpret_cast<const int*>(q8.codes + i);
         const float d = __half2float(__ushort_as_half(q8.scales[i / 32]));
 #pragma unroll
@@ -509,7 +548,7 @@ __device__ __forceinline__ void load4(const half* c, const Kvq8& q8, size_t i, f
     }
 }
 
-template <bool KQ8, bool VQ8, class Rows>
+template <bool KQ8, int VQ8, class Rows>
 __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs a, Rows rows) {
     __shared__ float sm_m[DEC_WARPS][AT_PER], sm_l[DEC_WARPS][AT_PER];
     __shared__ float sm_o[DEC_WARPS][AT_PER][AT_DIM];
@@ -685,7 +724,10 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs 
             const float f = M == -INFINITY ? 0.0f : expf(M - mx);
             const float denom = L * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
             const size_t i = th * AT_DIM + d;
-            const float o = O * f / denom, y = a.gate ? o * sigmoidf(a.gate[i]) : o;
+            float o = O * f / denom;
+            if constexpr (VQ8 == 2)
+                if (r.vq.wht) o = wht_back(o, lane);
+            const float y = a.gate ? o * sigmoidf(a.gate[i]) : o;
             a.out[i] = y;
             if (a.out_q8_1) fm::q8_1(y, static_cast<fm::Q81*>(a.out_q8_1) + i / 32);
         }
@@ -1004,9 +1046,16 @@ static_assert(16 * MMA_WARPS / AT_PER * AT_PER >= 16 * MMA_WARPS - 2, "attn_mma_
 // that hold a distance below the extent compute it.  The tiles are counted from position 0, so a row's sums do
 // not depend on the other rows of the block.  The sink is added at the end, as one more weight of no value.
 // inkling2 fork, F16 (INKLING2_ATTN_F16, opt-in): 1 sums a tile's P V in halves (the tiles' sums in floats, as
-// before), 2 Q K^T too (a score's 128 products in halves).
-template <bool KQ8, bool VQ8, int F16 = 0>
-__global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) {
+// before), 2 Q K^T too (a score's 128 products in halves).  F16 + 4 (the default; INKLING2_ATTN_CVT=0 off): a Q8_0 or 4-bit
+// cache's codes become halves without int-to-float conversions (a quarter-rate instruction on GeForce cards, one a
+// code: about as many cycles as the tile's tensor-core steps): the code's byte (or four bits) under the bits of 1024
+// as a half, less 1024 and the code's offset (exact), times the scale as halves - the same product rounded once,
+// so the same bits as the floats' (code * scale rounded to a half).
+// inkling2 fork: F16's kernels are held to 168 registers (3 blocks an SM, as the float kernel's 166 are).  Left free
+// they took 173, so 2 blocks an SM on an RTX 5070 (65,536 registers): 47% slower at 128K, which was the 13-14% slower
+// prompt reads at 128K; held, the three take the same time (F16 1 and 2 about 1% faster than the floats).
+template <bool KQ8, int VQ8, int F16 = 0>
+__global__ void __launch_bounds__(MMA_WARPS * WARP, (F16 & 3) >= 1 ? 3 : 0) attn_mma_kernel(AttnArgs a) {
 #if INKLING_MMA
     __shared__ __align__(16) half ks[MMA_KEYS][MMA_KROW], vs[MMA_KEYS][MMA_KROW];
     __shared__ __align__(16) half slice[MMA_SLICE][MMA_TROW];
@@ -1051,8 +1100,43 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
             uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;
             if (key >= lo && key < hi) {
                 const size_t at = (size_t(a.ring > 0 ? key % a.ring : key) * a.kv_heads + g) * AT_DIM + c;
-                const auto load = [&](const half* f16, const Kvq8& q8, bool quant) {
+                const auto load = [&](const half* f16, const Kvq8& q8, int quant) {
                     if (!quant) return *reinterpret_cast<const uint4*>(f16 + at);
+                    if constexpr ((F16 & 4) != 0) {   // inkling2 fork, INKLING2_ATTN_CVT
+                        const __half2 d2 = __half2half2(__ushort_as_half(q8.scales[at / 32]));
+                        uint32_t h[4];
+                        if (quant == 2) {   // 4-bit codes: 1024 + c as a half, less 1032
+                            const uint32_t word =
+                                *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(q8.codes) + at / 2);
+                            const __half2 off = __half2half2(__ushort_as_half((unsigned short) 0x6408));
+                            for (int j = 0; j < 4; ++j) {
+                                const uint32_t b = word >> (8 * j);
+                                const uint32_t x = (b & 0xFu) | ((b << 12) & 0xF0000u) | 0x64006400u;
+                                const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&x), off), d2);
+                                h[j] = *reinterpret_cast<const uint32_t*>(&v);
+                            }
+                        } else {   // Q8_0 codes: their bytes offset by 128 under 1024, less 1152
+                            const uint2 codes = *reinterpret_cast<const uint2*>(q8.codes + at);
+                            const __half2 off = __half2half2(__ushort_as_half((unsigned short) 0x6480));
+                            for (int j = 0; j < 4; ++j) {
+                                const uint32_t w = (j < 2 ? codes.x : codes.y) ^ 0x80808080u;
+                                const uint32_t x = __byte_perm(w, 0x64646464u, j % 2 ? 0x4342 : 0x4140);
+                                const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&x), off), d2);
+                                h[j] = *reinterpret_cast<const uint32_t*>(&v);
+                            }
+                        }
+                        return make_uint4(h[0], h[1], h[2], h[3]);
+                    }
+                    if (quant == 2) {   // inkling2 fork, --kv k8v4: eight 4-bit codes, four bytes
+                        const unsigned word =
+                            *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(q8.codes) + at / 2);
+                        const float d = __half2float(__ushort_as_half(q8.scales[at / 32]));
+                        uint32_t h[4];
+                        for (int j = 0; j < 4; ++j)
+                            h[j] = half2_bits((float) (int((word >> (8 * j)) & 15u) - 8) * d,
+                                              (float) (int((word >> (8 * j + 4)) & 15u) - 8) * d);
+                        return make_uint4(h[0], h[1], h[2], h[3]);
+                    }
                     const uint2 codes = *reinterpret_cast<const uint2*>(q8.codes + at);
                     const float d = __half2float(__ushort_as_half(q8.scales[at / 32]));
                     uint32_t h[4];
@@ -1089,7 +1173,7 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
             for (int k = 0; k < 8; k += 2) {
                 uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
                 ldmatrix_x4(b, &ks[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
-                if constexpr (F16 >= 2) {
+                if constexpr ((F16 & 3) >= 2) {
                     mma16816_h(sh, qa[k], b);
                     mma16816_h(sh, qa[k + 1], b + 2);
                 } else {
@@ -1097,7 +1181,7 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
                     mma16816(s[n], qa[k + 1], b + 2);
                 }
             }
-            if constexpr (F16 >= 2) add_halves(s[n], sh);
+            if constexpr ((F16 & 3) >= 2) add_halves(s[n], sh);
         }
         if (near) {
             // the warp's rows times its distances: column e is distance p0 + wt0 - (k0 + MMA_KEYS - 1) + e
@@ -1143,7 +1227,7 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
                 }
         }
         uint32_t oh[16][2];
-        if constexpr (F16 >= 1)
+        if constexpr ((F16 & 3) >= 1)
             for (int n = 0; n < 16; ++n) oh[n][0] = oh[n][1] = 0u;
         for (int k = 0; k < MMA_KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
             const uint32_t pa[4] = {half2_bits(s[2 * k][0], s[2 * k][1]), half2_bits(s[2 * k][2], s[2 * k][3]),
@@ -1152,7 +1236,7 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
             for (int n = 0; n < 16; n += 2) {
                 uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
                 ldmatrix_x4(b, &vs[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
-                if constexpr (F16 >= 1) {
+                if constexpr ((F16 & 3) >= 1) {
                     mma16816_h(oh[n], pa, b);
                     mma16816_h(oh[n + 1], pa, b + 2);
                 } else {
@@ -1161,7 +1245,7 @@ __global__ void __launch_bounds__(MMA_WARPS * WARP) attn_mma_kernel(AttnArgs a) 
                 }
             }
         }
-        if constexpr (F16 >= 1)
+        if constexpr ((F16 & 3) >= 1)
             for (int n = 0; n < 16; ++n) add_halves(o[n], oh[n]);
     }
     for (int i = 0; i < 2; ++i) {
@@ -1195,7 +1279,7 @@ bool mma_attention() {
 #endif
 }
 
-template <int TQ, bool KQ8, bool VQ8>
+template <int TQ, bool KQ8, int VQ8>
 void launch_attn(const AttnArgs& a, dim3 g, cudaStream_t st) {
     constexpr size_t smem = attn_smem(TQ);
     if constexpr (smem > 48 * 1024) {
@@ -1209,8 +1293,9 @@ void launch_attn(const AttnArgs& a, dim3 g, cudaStream_t st) {
 }
 
 template <int TQ>
-void launch_attn_q(const AttnArgs& a, dim3 g, cudaStream_t st, bool kq8, bool vq8) {
-    if (kq8 && vq8) launch_attn<TQ, true, true>(a, g, st);
+void launch_attn_q(const AttnArgs& a, dim3 g, cudaStream_t st, bool kq8, bool vq8, bool vq4) {
+    if (vq4) launch_attn<TQ, true, 2>(a, g, st);   // inkling2 fork, --kv k8v4 (Q8_0 keys)
+    else if (kq8 && vq8) launch_attn<TQ, true, true>(a, g, st);
     else if (kq8) launch_attn<TQ, true, false>(a, g, st);
     else if (vq8) launch_attn<TQ, false, true>(a, g, st);
     else launch_attn<TQ, false, false>(a, g, st);
@@ -1231,9 +1316,12 @@ void splits_of(long long span_room, int window, int& split, int& nslot) {
 }
 
 template <class Rows>
-void launch_dec(const AttnArgs& a, const Rows& rows, int ntok, bool kq, bool vq, bool int8_dot, cudaStream_t st) {
+void launch_dec(const AttnArgs& a, const Rows& rows, int ntok, bool kq, bool vq, bool vq4, bool int8_dot,
+                cudaStream_t st) {
     const dim3 gd((unsigned) a.nslot, a.kv_heads, ntok);
-    if (int8_dot && kq && vq && a.window <= 0) {   // a full layer's rows of long splits by __dp4a, the others not
+    if (vq4) {   // inkling2 fork, --kv k8v4 (Q8_0 keys); STRATA_KV_INT8's kernel reads 8-bit values only
+        attn_dec_kernel<true, 2, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    } else if (int8_dot && kq && vq && a.window <= 0) {   // a full layer's rows of long splits by __dp4a, the others not
         AttnArgs b = a;
         b.i8_from = I8_MIN_SPLIT;
         const int big = rows_from(rows, a, ntok, I8_MIN_SPLIT);
@@ -1344,7 +1432,7 @@ __global__ void conv_state_kernel(const float* __restrict__ x, float* __restrict
 // The state as it is after token t of x (t < rows) for each of the call's snapshot tokens (Snaps), row blockIdx.y
 // of them into snap + blockIdx.y * stride: what conv_state_kernel leaves after t + 1 tokens.  Before the call
 // advances the state.
-constexpr int SNAPS_MAX = 32;
+constexpr int SNAPS_MAX = 64;   // inkling2 fork: 32 before, for windows of up to 64
 struct Snaps {
     int t[SNAPS_MAX];
 };
@@ -1842,6 +1930,43 @@ struct KvSeqs {
     __device__ long long pos(const KvArgs&, int t) const { return (long long) row[t].pos; }
 };
 
+// inkling2 fork, --kv k8v4: a 32-value block's 4-bit codes, a lane value `at` of it (at % 32 == lane): ggml Q4_0's
+// rule - the delta is the block's value of the largest magnitude (the larger one of a tie) / -8, a code
+// round(x / delta) + 8 clamped to 0..15, so that value is code 0 - and value 2i in byte i's low four bits.
+__device__ __forceinline__ void store_q4_lane(float x, int8_t* codes, uint16_t* scales, size_t at, int lane) {
+    float mx = x;
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) {
+        const float y = __shfl_xor_sync(0xffffffffu, mx, o, WARP);
+        if (fabsf(y) > fabsf(mx) || (fabsf(y) == fabsf(mx) && y > mx)) mx = y;
+    }
+    const float dl = mx / -8.0f, id = dl != 0.0f ? 1.0f / dl : 0.0f;
+    const int q = (int) fminf(fmaxf(rintf(x * id), -8.0f), 7.0f) + 8;
+    const int hi = __shfl_down_sync(0xffffffffu, q, 1, WARP);
+    if (lane == 0) scales[at / 32] = __half_as_ushort(__float2half(dl));
+    if ((lane & 1) == 0) reinterpret_cast<uint8_t*>(codes)[at / 2] = (uint8_t) (q | (hi << 4));
+}
+
+// inkling2 fork, --kv k8v4: rows of n values (a multiple of 32) to the 4-bit cache from row `pos`, a warp a block
+__global__ void store_q4_kernel(const float* __restrict__ x, int8_t* codes, uint16_t* scales, int n, long long pos,
+                                int rows, bool wht) {
+    const long long blk = (long long) blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
+    const int lane = threadIdx.x % WARP;
+    if (blk >= (long long) rows * (n / 32)) return;   // a whole warp
+    const size_t i = size_t(blk) * 32 + lane;
+    const float v = x[i];
+    store_q4_lane(wht ? wht_to(v, lane) : v, codes, scales, size_t(pos) * n + i, lane);
+}
+
+// inkling2 fork, --kv k8v4 (the tensor-core path): out's rows of 32 values turned back from the rotation in place
+__global__ void wht_back_kernel(float* out, long long blocks) {
+    const long long blk = (long long) blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
+    const int lane = threadIdx.x % WARP;
+    if (blk >= blocks) return;
+    float* p = out + size_t(blk) * 32 + lane;
+    *p = wht_back(*p, lane);
+}
+
 // A block's head g of K (which 0) or of V (1); part: AT_DIM / WARP floats of shared memory.
 template <class Rows>
 __device__ __forceinline__ void kv_store_head(const KvArgs& a, const Rows& rows, int g, int which, float* part) {
@@ -1879,6 +2004,8 @@ __device__ __forceinline__ void kv_store_head(const KvArgs& a, const Rows& rows,
         if (!q8) {
             half* cache = reinterpret_cast<half*>(which ? dst.v : dst.k);
             cache[size_t(row) * channels + c] = __float2half(val);
+        } else if (which && dst.v4) {   // inkling2 fork, --kv k8v4: store_q4()'s rule, a warp a block
+            store_q4_lane(dst.v_wht ? wht_to(val, lane) : val, dst.vc, dst.vs, size_t(row) * channels + c, lane);
         } else {
             // a warp is a Q8_0 block of 32 values: store_q8's rule
             float amax = fabsf(val);
@@ -1973,6 +2100,8 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     a.vq = vq8;
     a.pos = (long long) pos;
     const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr;
+    const bool vq4 = vq && vq8.bits == 4;   // inkling2 fork, --kv k8v4
+    if (vq4 && !kq) throw std::invalid_argument("inkling_attend: 4-bit values need Q8_0 keys");
     const cudaStream_t st = cs(stream);
     // positions + 1, at most: the caller's room when it gives one, else pos + rows
     const long long span_room = room > 0 ? (long long) room : (long long) pos + rows;
@@ -1983,8 +2112,8 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         if (need <= work_floats) {
             a.gate = gate;
             a.out_q8_1 = out_q8_1;
-            if (at) launch_dec(a, AttnAt{at}, rows, kq, vq, int8_dot, st);
-            else launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
+            if (at) launch_dec(a, AttnAt{at}, rows, kq, vq, vq4, int8_dot, st);
+            else launch_dec(a, AttnOne{}, rows, kq, vq, vq4, int8_dot, st);
             return;
         }
     }
@@ -1996,7 +2125,25 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
             const char* v = std::getenv("INKLING2_ATTN_F16");
             return v ? std::atoi(v) : 0;
         }();
-        if (f16 >= 2) {
+        // inkling2 fork: the codes to halves without conversions (Q8_0 keys), the same bits; on by default since
+        // 2026-11-24, INKLING2_ATTN_CVT=0 takes the conversions as before.  With it this kernel runs at about 96% of
+        // the card's rate for these tensor-core steps with float sums (RTX 5070: 47.8 TFLOPS by inkling2_attn_bench
+        // peak; 2048 tokens at 254K: 46 TFLOPS of Q K^T and P V), so skipping work beside those steps (the masks of
+        // tiles every row sees whole, the rescale by a factor of 1) changed nothing measurable and was not kept.
+        static const bool cvt = [] {
+            const char* v = std::getenv("INKLING2_ATTN_CVT");
+            return !v || std::atoi(v) != 0;
+        }();
+        if (vq4) {   // inkling2 fork, --kv k8v4: the float kernel, then the output turned back from the rotation
+            if (cvt) attn_mma_kernel<true, 2, 4><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            else attn_mma_kernel<true, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+            if (vq8.wht) {
+                const long long blocks = (long long) rows * n_head * dim / 32;
+                wht_back_kernel<<<(unsigned) ((blocks + 7) / 8), 8 * WARP, 0, st>>>(out, blocks);
+            }
+        } else if (cvt && kq && vq && f16 == 0) {
+            attn_mma_kernel<true, true, 4><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
+        } else if (f16 >= 2) {
             if (kq && vq) attn_mma_kernel<true, true, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
             else if (kq) attn_mma_kernel<true, false, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
             else if (vq) attn_mma_kernel<false, true, 2><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
@@ -2018,10 +2165,10 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     const int tq = rows >= 8 ? 8 : rows >= 4 ? 4 : rows >= 2 ? 2 : 1;
     const dim3 g(1, kv_heads, (rows + tq - 1) / tq);
     switch (tq) {
-        case 8: launch_attn_q<8>(a, g, st, kq, vq); break;
-        case 4: launch_attn_q<4>(a, g, st, kq, vq); break;
-        case 2: launch_attn_q<2>(a, g, st, kq, vq); break;
-        default: launch_attn_q<1>(a, g, st, kq, vq); break;
+        case 8: launch_attn_q<8>(a, g, st, kq, vq, vq4); break;
+        case 4: launch_attn_q<4>(a, g, st, kq, vq, vq4); break;
+        case 2: launch_attn_q<2>(a, g, st, kq, vq, vq4); break;
+        default: launch_attn_q<1>(a, g, st, kq, vq, vq4); break;
     }
     check_launch("inkling_attend");
     if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
@@ -2039,10 +2186,13 @@ void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, I
                            work);
     a.nslot = 1;
     const bool kq = seqs[0].kq8.codes != nullptr, vq = seqs[0].vq8.codes != nullptr;
+    const bool vq4 = vq && seqs[0].vq8.bits == 4;   // inkling2 fork, --kv k8v4
+    if (vq4 && !kq) throw std::invalid_argument("inkling_attend_seqs: 4-bit values need Q8_0 keys");
     AttnSeqs r{};
     for (int t = 0; t < rows; ++t) {
         const InklingAttnSeq& c = seqs[t];
-        if ((c.kq8.codes != nullptr) != kq || (c.vq8.codes != nullptr) != vq)
+        if ((c.kq8.codes != nullptr) != kq || (c.vq8.codes != nullptr) != vq ||
+            (vq && (c.vq8.bits == 4) != vq4))
             throw std::invalid_argument("inkling_attend_seqs: every row's caches of one kind");
         AttnRow& w = r.r[t];
         w.kc = (const half*) c.kcache, w.vc = (const half*) c.vcache, w.kq = c.kq8, w.vq = c.vq8;
@@ -2052,7 +2202,7 @@ void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, I
     }
     if (size_t(rows) * n_head * a.nslot * (AT_DIM + 2) > work_floats)
         throw std::invalid_argument("inkling_attend_seqs: work too small");
-    launch_dec(a, r, rows, kq, vq, int8_dot, cs(stream));
+    launch_dec(a, r, rows, kq, vq, vq4, int8_dot, cs(stream));
 }
 
 namespace {
@@ -2086,7 +2236,7 @@ void inkling_conv_acc(const float* x, float* state, const float* w, const float*
     conv_any<true>(x, state, w, taps, heads, acc, channels, rows, stream);
 }
 
-void inkling_conv_snaps(const float* x, const float* state, int channels, int rows, unsigned bits, float* snap,
+void inkling_conv_snaps(const float* x, const float* state, int channels, int rows, uint64_t bits, float* snap,
                         size_t stride, void* stream) {
     Snaps snaps{};
     int n = 0;
@@ -2356,7 +2506,11 @@ void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, floa
                 const int64_t p = pos + done;
                 const int64_t r = dst.ring > 0 ? p % dst.ring : p;
                 const int m = dst.ring > 0 ? (int) std::min<int64_t>(rows - done, dst.ring - r) : rows - done;
-                if (codes) store_q8(x + size_t(done) * width, codes, scales, width, r, m, stream);
+                if (side && dst.v4) {   // inkling2 fork, --kv k8v4
+                    const long long blocks = (long long) m * (width / 32);
+                    store_q4_kernel<<<(unsigned) ((blocks + 7) / 8), 8 * WARP, 0, cs(stream)>>>(
+                        x + size_t(done) * width, codes, scales, width, (long long) r, m, dst.v_wht);
+                } else if (codes) store_q8(x + size_t(done) * width, codes, scales, width, r, m, stream);
                 else store_f16(x + size_t(done) * width, cache, width, r, m, stream);
                 done += m;
             }
@@ -2409,6 +2563,37 @@ void inkling_kv_store_seqs(const float* kraw, const float* vraw, const InklingKv
     for (int t = 0; t < rows; ++t) r.row[t] = seqs[t];
     kv_store_kernel<<<dim3(kv_heads, 2, rows), AT_DIM, 0, cs(stream)>>>(a, r);
     check_launch("inkling_kv_store_seqs");
+}
+
+// inkling2 fork, INKLING2_VISIT_TRACE
+namespace {
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void stamp_kernel(unsigned long long* ring, unsigned* idx, unsigned cap, int tag) {
+    const unsigned long long t = global_ns();
+    const unsigned i = atomicAdd(idx, 1u);
+    if (i < cap) ring[2 * (size_t) i] = (unsigned long long) tag, ring[2 * (size_t) i + 1] = t;
+}
+__global__ void clock_spin_kernel(volatile unsigned long long* mapped, long long ns) {
+    const unsigned long long t0 = global_ns();
+    for (;;) {
+        const unsigned long long t = global_ns();
+        *mapped = t;
+        __threadfence_system();
+        if ((long long) (t - t0) > ns) break;
+    }
+}
+}  // namespace
+
+void inkling_stamp(unsigned long long* ring, unsigned* idx, unsigned cap, int tag, void* stream) {
+    stamp_kernel<<<1, 1, 0, cs(stream)>>>(ring, idx, cap, tag);
+}
+
+void inkling_clock_spin(unsigned long long* mapped, long long ns, void* stream) {
+    clock_spin_kernel<<<1, 1, 0, cs(stream)>>>(mapped, ns);
 }
 
 }  // namespace strata::poly

@@ -212,7 +212,7 @@ void inkling_conv(const float* x, float* state, const float* w, const float* tap
 /// A window's snapshots of a convolution's state (Engine::window()): for the k-th token t of the call whose bit is
 /// set in `bits` (t < rows), the state as inkling_conv() leaves it after tokens 0 to t, into snap + k * stride
 /// (floats).  x and state as inkling_conv()'s, before the call advances the state.
-void inkling_conv_snaps(const float* x, const float* state, int channels, int rows, unsigned bits, float* snap,
+void inkling_conv_snaps(const float* x, const float* state, int channels, int rows, uint64_t bits, float* snap,
                         size_t stride, void* stream);
 
 // ---- depth mix -----------------------------------------------------------------------------------------------
@@ -300,6 +300,10 @@ struct InklingKvDst {
     int8_t* vc = nullptr;
     uint16_t* vs = nullptr;
     int ring = 0;
+    /// inkling2 fork, --kv k8v4: the values in 4 bits (vc two codes a byte, Kvq8::bits 4), each 32-value block
+    /// rotated first with v_wht (inkling_kv_rotation())
+    bool v4 = false;
+    bool v_wht = false;
 };
 /// A layer's K and V from their projections to the cache, in one launch for up to 16 tokens:
 ///   k = inkling_conv(kraw, k_state, k_w, k_taps) then inkling_clip(k, no scale, k_clip),
@@ -422,5 +426,11 @@ void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, fl
 /// in one launch and without the floats.  n a multiple of 32.
 void situ_rows_q8_1(const float* gate_up, void* q8_1, int n, int rows, float beta, float lb, void* stream,
                     const ExpertScales* scales = nullptr);
+
+/// inkling2 fork, INKLING2_VISIT_TRACE (opt-in): the card's clock (%globaltimer, ns) with a tag into ring[2 i], ring[2 i + 1]
+/// at the next of `idx` (device memory), up to cap entries.  inkling_clock_spin(): the clock into mapped host memory, again
+/// and again for `ns`, so that the host can match it to its own.
+void inkling_stamp(unsigned long long* ring, unsigned* idx, unsigned cap, int tag, void* stream);
+void inkling_clock_spin(unsigned long long* mapped, long long ns, void* stream);
 
 }  // namespace strata::poly

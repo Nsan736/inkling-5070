@@ -192,11 +192,14 @@ def choose(ram_total, vram_mib, vram_limit_mib, cores):
     # engine's own ~2.5 GB get 14 GB first
     ram_experts = int(min(9216, max(1024, (ram_total - 14) * 1024)))
     threads = max(2, min(12, cores))
+    # pinned RAM for a long prompt's rows (--read-mib): fewer passes over the prompt, so the experts outside VRAM
+    # are copied fewer times (32K to 128K read 4-6% faster with 2-4 GiB on the PC above); only while reading
+    read_mib = 2048 if ram_total >= 30 else 1024 if ram_total >= 15 else 512
     args = ["--max-context", str(ctx + 1024), "--threads", str(threads), "--window", "8", "--lookup", "3",
             "--prompt-batch", str(batch), "--vram-reserve-mib", str(reserve), "--ram-experts-mib", str(ram_experts),
-            "--kv", "q8_0"]
+            "--read-mib", str(read_mib), "--kv", "q8_0"]
     return args, {"context": ctx, "prompt_batch": batch, "vram_reserve_mib": reserve, "ram_experts_mib": ram_experts,
-                  "threads": threads}
+                  "read_mib": read_mib, "threads": threads}
 
 
 # What setup expects of a choice: the GGUFs' sizes (experts and the rest, MiB; 3072 routed experts: 24 layers of
@@ -205,9 +208,11 @@ def choose(ram_total, vram_mib, vram_limit_mib, cores):
 # an 8K prompt / of writing at temperature 1.0 after it, and at 64K / 128K / 256K (the last 8K read after the rest).
 # kld: 2K's mean KL divergence from unsloth's Q8_K_XL (llama.cpp's logits).  256K (12 GB): with LONG_ARGS, the
 # last 8K read after 245,758 tokens; reading all 253,950 from the start: 1355 tok/s (IQ2_XXS).
+# IQ4_XS's writing at 12 GB is 0.3.2's (2026-11-24), measured after one warm-up answer on the same prompt (the first
+# answer after a start is about 10% slower); its reading and the other rows are 0.3.1's.
 SIZES = {"iq4_xs": (13385, 1138), "q3_k_xl": (11633, 1051), "q2_k_xl": (7522, 946), "iq2_xxs": (6915, 931)}
 MEASURED = {
-    "iq4_xs": {"kld": 0.0026, 12: {8: (2162, 66.7), 64: (1725, 51.2), 128: (1327, 43.8), 256: (848, 33.6)},
+    "iq4_xs": {"kld": 0.0026, 12: {8: (2162, 70.7), 64: (1725, 54.7), 128: (1327, 44.3), 256: (848, 36.6)},
                8: {8: (1902, 51.4), 64: (1541, 34.3), 128: (1214, 25.3)}, 6: {8: (1795, 35.0), 64: (1446, 19.4)}},
     "q3_k_xl": {"kld": 0.0090, 12: {8: (2186, 69.0), 64: (1741, 55.4), 128: (1340, 45.1)},
                 8: {8: (2003, 57.6), 64: (1650, 38.8), 128: (1253, 26.1)}, 6: {8: (1949, 39.0), 64: (1532, 22.2)}},

@@ -24,6 +24,38 @@ fit in VRAM; the others are computed on the CPU from RAM.
 Quality, against llama.cpp 690b87d's logits (KV fp16) for 1,023 positions of a 2,048-token text: mean KLD 0.00491,
 top-1 agreement 97.36%, perplexity 3.518 against llama.cpp's 3.516.
 
+## 0.3.2 (November 24, 2026)
+
+Measured warm: each answer after one uncounted answer on the same prompt in the same engine (the first answer after
+a start is about 10% slower while the VRAM expert cache settles: at 8K its hit rate went 89% -> 93% and the CPU's
+experts a token 45 -> 27). Temperature 1.0, tokens 17-216, one run each; the bench settings above (`--max-context`
+the length plus 1,024). HAGS on. The numbers are in `docs/charts/measurements.json`.
+
+| Context | Prose | Code |
+|---|---|---|
+| 8K | 70.7 tok/s | 71.5 tok/s |
+| 64K | 54.7 tok/s | 55.5 tok/s |
+| 128K | | 44.3 tok/s |
+| 256K | | 36.6 tok/s |
+
+Reading a prompt from the start (source code, nothing reused): 4K 2,565, 32K 2,475, 64K 2,327, 128K 1,997, 256K
+1,581 tok/s.
+
+What changed against 0.3.1 (each measured on its own, the same bits unless noted):
+
+| Change | Effect |
+|---|---|
+| Prompt attention without int-to-float conversions | 256K read +2-3% |
+| Read's embeddings on the CPU threads | 32K read +2.5% |
+| Fewer passes over a long prompt (`--read-mib`) | 32K / 64K / 128K read +4% / +5% / +6% |
+| Tiled F32 products for the loop's gates | 32K read +5% |
+| (the three above together) | 4K / 32K / 64K read +5% / +9% / +11% |
+| AVX-VNNI CPU expert dot product | 64K writing +8-12% (8K: no change) |
+
+- Quality at 2K against Q8_K_XL: mean KLD 0.0026, top-1 98.4%, the same as 0.3.1 (the changes keep the bits).
+- With HAGS off the same PC wrote 54.1 / 55.1 tok/s at 8K (prose / code) and 43.8 / 45.1 at 64K, the first answer
+  after a start; the GPU took 120 us to start what the host sent it (20 us with HAGS on).
+
 ## 0.2.0: smaller models, VRAM budgets, 256K (November 23, 2026)
 
 Same PC and settings, temperature 1.0. The 8 GB and 6 GB budgets are the RTX 5070 with `--vram-reserve-mib 4435` /

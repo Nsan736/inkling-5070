@@ -28,6 +28,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1941,6 +1942,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
                                  "(inkling2_loop, inkling2) models in v1; this is a '" + name + "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
+    if ((o.kv_format == KvFmt::kK8V4 || o.kv_format == KvFmt::kK8V4Plain) && !inkling)   // inkling2 fork
+        throw std::runtime_error("--kv k8v4 is Inkling 2's; this is a '" + name + "' model");
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))
         throw std::runtime_error("--kv int8 and --kv int8k are Gemma 4's; for a qwen35moe or kolibri1 model use "
                                  "--kv q8_0 (this is a '" + name + "' model)");
@@ -3129,8 +3132,10 @@ void Engine::load_layers(const Options& o) {
     if (opt_.stage_ahead < 0) throw std::runtime_error("the batch size to stage ahead from cannot be negative");
     if (opt_.expert_swaps < 0 || opt_.expert_swaps > 64)
         throw std::runtime_error("0 to 64 experts can be on their way into the cache at a time");
-    if (opt_.window < 0 || opt_.window > 8)
-        throw std::runtime_error("a window is 1 to 8 tokens, or 0 for the model's own");
+    // inkling2 fork: up to 64 (8 before).  Past 8 the window's tokens do not come out as in windows of 8 or fewer
+    // (the grouped dense launches and the card split take 8; the attention's split 16; MMQ from 32): other bits.
+    if (opt_.window < 0 || opt_.window > 64)
+        throw std::runtime_error("a window is 1 to 64 tokens, or 0 for the model's own");
     if (opt_.lock_experts && opt_.ram_experts_mib >= 0)
         throw std::runtime_error("--lock-experts locks every expert outside VRAM in RAM, so it does not go with "
                                  "--ram-experts-mib");
@@ -3579,10 +3584,100 @@ void Engine::shared_scratch() {
 }
 
 // The sequence's state, the caches and every buffer, once the weights are known.
+// inkling2 fork, INKLING2_VISIT_TRACE=FILE (opt-in): stamps of a visit on the card (%globaltimer) and on the host
+// (steady_clock), with tags; vt_dump() matches the clocks and writes them out.  Tags: card 1 the router's results in
+// pinned memory, 2 the router's event, 3 / 4 the cached experts' launches begin / end, 5 the CPU's sum added; host 10
+// the router noticed, 11 / 12 the launches begin / end on their thread, 13 the CPU experts called, 14 their first
+// product, 15 they returned, 16 moe() returns.
+namespace {
+struct VisitTrace {
+    bool on = false;
+    std::string path;
+    unsigned long long* d_ring = nullptr;
+    unsigned* d_idx = nullptr;
+    unsigned cap = 1u << 20;
+    std::vector<long long> h;
+    std::atomic<unsigned> hn{0};
+} vt;
+long long host_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+void vt_host(int tag) {
+    if (!vt.on) return;
+    const unsigned i = vt.hn.fetch_add(1, std::memory_order_relaxed);
+    if (i < vt.cap) vt.h[2 * (size_t) i] = tag, vt.h[2 * (size_t) i + 1] = host_ns();
+}
+}  // namespace
+
+void Engine::vt_gpu(int tag) {
+    if (vt.on) inkling_stamp(vt.d_ring, vt.d_idx, vt.cap, tag, st_);
+}
+
+void Engine::vt_dump() {
+    if (!vt.on) return;
+    ck(cudaDeviceSynchronize(), "visit trace");
+    unsigned n = 0;
+    ck(cudaMemcpy(&n, vt.d_idx, sizeof n, cudaMemcpyDeviceToHost), "visit trace");
+    n = std::min(n, vt.cap);
+    std::vector<unsigned long long> g(2 * (size_t) n);
+    if (n) ck(cudaMemcpy(g.data(), vt.d_ring, g.size() * sizeof(g[0]), cudaMemcpyDeviceToHost), "visit trace");
+    // the clocks: the card writes its clock into mapped memory again and again, and the host reads it with its own;
+    // the least host - card over the samples is the offset (the write's way to the host in it, about a microsecond)
+    unsigned long long* m = nullptr;
+    ck(cudaHostAlloc((void**) &m, 64, cudaHostAllocMapped), "visit trace");
+    *(volatile unsigned long long*) m = 0;
+    unsigned long long* dm = nullptr;
+    ck(cudaHostGetDevicePointer((void**) &dm, m, 0), "visit trace");
+    inkling_clock_spin(dm, 3000000, st_);
+    (void) cudaStreamQuery(cs(st_));   // hands the launch to the card now (without HAGS, WDDM holds it)
+    long long best = LLONG_MAX;
+    const long long until = host_ns() + 1000000000LL;
+    unsigned long long last = 0;
+    long long since = host_ns();
+    while (host_ns() < until) {
+        const unsigned long long v = *(volatile unsigned long long*) m;
+        const long long t = host_ns();
+        if (v && v != last) best = std::min(best, t - (long long) v), last = v, since = t;
+        else if (v && t - since > 50000000LL) break;   // no new value for 50 ms: the kernel is done
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "visit trace");
+    cudaFreeHost(m);
+    const unsigned hn = std::min(vt.hn.load(), vt.cap);
+    if (FILE* f = std::fopen(vt.path.c_str(), "a")) {
+        std::fprintf(f, "cal %lld\n", best);
+        for (unsigned i = 0; i < n; ++i) std::fprintf(f, "g %llu %llu\n", g[2 * (size_t) i], g[2 * (size_t) i + 1]);
+        for (unsigned i = 0; i < hn; ++i) std::fprintf(f, "h %lld %lld\n", vt.h[2 * (size_t) i], vt.h[2 * (size_t) i + 1]);
+        std::fclose(f);
+    }
+    ck(cudaMemset(vt.d_idx, 0, sizeof(unsigned)), "visit trace");
+    vt.hn.store(0);
+}
+
 void Engine::alloc() {
     // --dump-layers prints one token's stages
     rows_ = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
-    const size_t most = std::min<size_t>(kReadBytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
+    // inkling2 fork, Options::read_mib (or INKLING2_READ_MIB): the host memory a read's rows take, for kReadBytes.
+    // By default by the machine's RAM: a 32K prompt is one read with 2 GiB (its experts outside VRAM copied once a
+    // layer, not about four times: 32K +4%, 64K and 128K +5% at 4 GiB), and at most a quarter of what is free.
+    const size_t read_bytes = [&] {
+        const char* v = std::getenv("INKLING2_READ_MIB");
+        int mib = opt_.read_mib >= 0 ? opt_.read_mib : v && std::atoi(v) > 0 ? std::atoi(v) : -1;
+        if (mib < 0) {
+            size_t total = 0;
+#if defined(_WIN32)
+            MEMORYSTATUSEX st{};
+            st.dwLength = sizeof(st);
+            if (GlobalMemoryStatusEx(&st)) total = (size_t) st.ullTotalPhys;
+#endif
+            const size_t gib = total >> 30;
+            mib = gib >= 30 ? 2048 : gib >= 15 ? 1024 : 512;
+            const size_t free_mib = ram_available() >> 20;
+            if (free_mib > 0) mib = (int) std::min<size_t>((size_t) mib, free_mib / 4);
+        }
+        return std::max((size_t) mib << 20, kReadBytes);
+    }();
+    const size_t most = std::min<size_t>(read_bytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
     read_rows_ = rows_ < kStageRows ? rows_ : std::max(rows_, (int) most / rows_ * rows_);
     rec_n_ = recurrent_floats();
     state_n_ = rec_n_ + (draft_ ? (size_t) n_embd_ : 0);
@@ -3798,6 +3893,15 @@ void Engine::alloc() {
         rs_ = rs;
     }
     use_.assign(layers_.size() * n_expert_, 0);
+    if (const char* p = std::getenv("INKLING2_VISIT_TRACE"); p && !vt.on) {   // inkling2 fork
+        vt.path = p;
+        vt.d_ring = (unsigned long long*) dmalloc(2 * (size_t) vt.cap * sizeof(unsigned long long), "visit trace");
+        vt.d_idx = (unsigned*) dmalloc(sizeof(unsigned), "visit trace");
+        ck(cudaMemset(vt.d_idx, 0, sizeof(unsigned)), "visit trace");
+        vt.h.assign(2 * (size_t) vt.cap, 0);
+        vt.on = true;
+        g_visit_trace = vt_host;
+    }
 }
 
 void Engine::save_profile() const {
@@ -4267,6 +4371,7 @@ int Engine::card_rows() const { return block_guess_ ? std::max(kSumRows, opt_.wi
 void Engine::moe_router(const Layer& L, int n) {
     router_scores(L, n);
     copy2(rl_, h_rl_, n * n_expert_, xn_, h_x_, n * n_embd_, st_);
+    vt_gpu(1);   // inkling2 fork, INKLING2_VISIT_TRACE
     if (zc_ahead_ < 0) {   // inkling2 fork
         // the read-ahead scores by a kernel into pinned memory, on by default: on Windows (WDDM) the copy engine's
         // start held every visit's router wait up (+13% at 8K on an RTX 5070); INKLING2_ZC_AHEAD=0 copies as before
@@ -4283,7 +4388,7 @@ void Engine::moe_router(const Layer& L, int n) {
     const auto signal = [&] {
         if (flag_wait_ > 0 && n == 1 && !block_pass_) signal_seq(seq_dev_, seq_host_, st_);
     };
-    if (prefetch_k_ <= 0 || block_pass_ || n > 16) return signal();
+    if (prefetch_k_ <= 0 || block_pass_ || n > 16) return vt_gpu(2), signal();
     size_t part = 0;
     for (size_t q = 0; q < 8; ++q)
         if (ev_ == ev_row_[q]) part = q;
@@ -4292,7 +4397,7 @@ void Engine::moe_router(const Layer& L, int n) {
     // input, for pool_ahead()
     int j = (int) (&L - layers_.data()) + 1;
     while (j < n_layer_ && !routed(layers_[(size_t) j])) ++j;
-    if (j >= n_layer_) return;
+    if (j >= n_layer_) return vt_gpu(2);
     float* d = ahead_dev_ + part * 16 * ne;
     lin(layers_[(size_t) home_of(j)].gate_inp, xn_, d, n, xq_);
     if (zc_ahead_ > 0) copy2(d, h_ahead_ + part * 16 * ne, n * (int) ne, nullptr, nullptr, 0, st_);   // no copy engine
@@ -4300,6 +4405,7 @@ void Engine::moe_router(const Layer& L, int n) {
         ck(cudaMemcpyAsync(h_ahead_ + part * 16 * ne, d, (size_t) n * ne * sizeof(float), cudaMemcpyDeviceToHost,
                            cs(st_)),
            "read ahead");
+    vt_gpu(2);
     signal();
 }
 
@@ -4735,6 +4841,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
     }
     stats_.route_wait_ms += ms_since(t0);
+    vt_host(10);   // inkling2 fork, INKLING2_VISIT_TRACE
     // inkling2 fork, INKLING2_TIMELINE: this visit's times (the visit before's events are done: the router's are)
     if (tl_on_ < 0) {
         tl_on_ = std::getenv("INKLING2_TIMELINE") ? 1 : 0;
@@ -4996,6 +5103,12 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         // the card meanwhile: on this thread they held the CPU experts up.
         const std::function<void()> launch = [&] {
             if (split_) cudaSetDevice(device_);   // one of the experts' threads, which every card's engine shares
+            vt_host(11);   // inkling2 fork, INKLING2_VISIT_TRACE: and 12 / card 4 when the launches are done
+            vt_gpu(3);
+            struct Done {
+                Engine* e;
+                ~Done() { e->vt_gpu(4), vt_host(12); }
+            } done{this};
             if (tl && !tl_launched && !split) {
                 stats_.tl_host_ms += ms_since(tl_t0);
                 ck(cudaEventRecord((cudaEvent_t) tl_ev_[0], cs(st_)), "timeline");
@@ -5093,6 +5206,10 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         }
         // A read that failed is made once more by one of the waiting threads, then through the mapping.
         const std::function<void(int)> wait = [&](int j) {
+            vt_host(17);   // inkling2 fork, INKLING2_VISIT_TRACE: a late expert waited for (18: there)
+            struct Done {
+                ~Done() { vt_host(18); }
+            } done;
             const size_t v = pool_slot_of(il, host[j].gate);
             uint8_t st;
             while ((st = pool_state_[v].load(std::memory_order_acquire)) != 0) {
@@ -5112,9 +5229,12 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                 if (!pool_help()) std::this_thread::yield();
             }
         };
+        vt_host(13);   // inkling2 fork, INKLING2_VISIT_TRACE
+        vt_host(1000 + n_host), vt_host(2000 + m);   // the call's experts and tokens
         cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_,
                     h_x_ + (size_t) at * e_row, limit, gelu_, cpu, meanwhile, any_late ? late : nullptr, &wait,
                     situ_ ? &*situ_ : nullptr, lowbit_experts_);
+        vt_host(15);
         pool_reads_.clear();
         stats_.cpu_ms += ms_since(t0);
         if (tl) tl_cpu_last_ += ms_since(t0);
@@ -5123,6 +5243,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
         ck(cudaEventRecord((cudaEvent_t) tl_ev_[2], cs(st_)), "timeline");
         tl_pending_ = true;
     }
+    vt_host(16);   // inkling2 fork, INKLING2_VISIT_TRACE
     return any_host;
 }
 
@@ -5142,7 +5263,10 @@ void Engine::tl_settle() {
 }
 
 // The CPU's experts of n tokens into the routed experts' sum.
-void Engine::moe_add(int n) { axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_); }
+void Engine::moe_add(int n) {
+    vt_gpu(5);   // inkling2 fork, INKLING2_VISIT_TRACE
+    axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_);
+}
 
 void Engine::act_rows(const float* gate_up, float* h, int rows, float limit, const ExpertScales* es) {
     if (situ_) situ_rows(gate_up, h, n_ff_exp_, rows, situ_->beta, situ_->lin_beta, st_, es);
@@ -5934,15 +6058,15 @@ void Engine::run(const int32_t* tokens, int n) {
     // (shift_rows()), so each token comes out as it would alone.
     if (n > 1 && windowed_ && !all_cached() && halves_) {
         const int first[3] = {0, (n + 1) / 2, n};   // half k is the tokens [first[k], first[k + 1])
-        const unsigned bits = snap_bits_;           // the window's tokens that leave the recurrent state
+        const uint64_t bits = snap_bits_;           // the window's tokens that leave the recurrent state
         int at = 0;
         // The buffers at half k's rows, and its share of the window's states.  Returns the half's tokens.
         const auto half = [&](int k) {
             shift_rows(first[k] - at);
             at = first[k];
             const int m = first[k + 1] - at;
-            snap_bits_ = bits >> at & ((1u << m) - 1u);
-            snap_at_ = snap_ + size_t(std::popcount(bits & ((1u << at) - 1u))) * rec_n_;
+            snap_bits_ = bits >> at & ((1ull << m) - 1ull);
+            snap_at_ = snap_ + size_t(std::popcount(bits & ((1ull << at) - 1ull))) * rec_n_;
             ev_ = ev_row_[k];
             return m;
         };
@@ -6810,12 +6934,22 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         float* rows = host ? home(c) : h_r_;
         if (pass_)
             std::memcpy(rows, pass_ + (size_t) (pos0 + call.at - pass_at_) * r_row, (size_t) call.m * r_bytes);
-        for (int t = 0; t < call.m && !pass_; ++t) {
-            float* r = rows + (size_t) t * r_row;
-            if (!input(tokens[call.at + t], pos0 + call.at + t, r) && scale != 1.f)
-                for (size_t i = 0; i < e_row; ++i) r[i] *= scale;
-            for (int h = 1; h < streams(); ++h) std::memcpy(r + (size_t) h * e_row, r, e_row * sizeof(float));
-        }
+        // inkling2 fork: the embeddings on the host's threads, 64 tokens a piece (a row is the same on any thread)
+        const auto embed_piece = [&](int p) {
+            for (int t = p * 64; t < std::min(call.m, p * 64 + 64); ++t) {
+                float* r = rows + (size_t) t * r_row;
+                if (!input(tokens[call.at + t], pos0 + call.at + t, r) && scale != 1.f)
+                    for (size_t i = 0; i < e_row; ++i) r[i] *= scale;
+                for (int h = 1; h < streams(); ++h) std::memcpy(r + (size_t) h * e_row, r, e_row * sizeof(float));
+            }
+        };
+        static const bool embed_mt = [] {   // INKLING2_EMBED_MT=0: on this thread alone, as before
+            const char* v = std::getenv("INKLING2_EMBED_MT");
+            return !v || std::atoi(v) != 0;
+        }();
+        const int pieces = (call.m + 63) / 64;
+        if (!pass_ && embed_mt && workers_ && pieces > 1) workers_->run(pieces, embed_piece);
+        else if (!pass_) for (int p = 0; p < pieces; ++p) embed_piece(p);
         if (host) continue;
         ck(cudaMemcpyAsync(half(c), h_r_, (size_t) call.m * r_bytes, cudaMemcpyHostToDevice, cs(st_)), "embed");
         ck(cudaStreamSynchronize(cs(st_)), "embed");   // h_r_ is filled again
@@ -6934,11 +7068,11 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
 // The tokens of a window of t that leave the recurrent state as it is after them: each but the last when there
 // is a place for each, else as many as there are places, the first token among them and the others spread over
 // the window.
-unsigned Engine::snap_tokens(int t) const {
+uint64_t Engine::snap_tokens(int t) const {
     const int most = t - 1;
-    if (most <= snap_places_) return (1u << most) - 1u;
-    unsigned bits = 0;
-    for (int i = 0; i < snap_places_; ++i) bits |= 1u << (i * most / snap_places_);
+    if (most <= snap_places_) return (1ull << most) - 1ull;
+    uint64_t bits = 0;
+    for (int i = 0; i < snap_places_; ++i) bits |= 1ull << (i * most / snap_places_);
     return bits;
 }
 
@@ -7023,7 +7157,7 @@ void Engine::keep(int n) {
         // The state after the last right token, when that token left it.  Else the one of the last token before
         // it that did, and the right tokens after that one go through the layers again: they come out as they
         // did, and the state with them.
-        const unsigned left = snap_tokens(win_) & ((1u << n) - 1u);   // the right tokens that left their state
+        const uint64_t left = snap_tokens(win_) & ((1ull << n) - 1ull);   // the right tokens that left their state
         const int from = (int) std::bit_width(left);                  // the tokens the state at hand is after
         ck(cudaMemcpyAsync(state_, snap_ + size_t(std::popcount(left) - 1) * rec_n_, rec_n_ * sizeof(float),
                            cudaMemcpyDeviceToDevice, cs(st_)),
@@ -7156,12 +7290,14 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     if (i < 0 || pos_ + i >= opt_.max_context) throw std::logic_error("draft: the position is outside the context");
     if (dspark_) {   // INKLING2_DSPARK: the block's 7 tokens at i == 0, then those
         if (i == 0) {
+            const Clock::time_point dt = Clock::now();   // inkling2 fork: the drafter's time (dsp_ms_)
             auto* d = (dspark::Drafter*) dsp_;
             embed_normed(token, dsp_anchor_);
             const float* h7 = dspark::block(d, token, dsp_anchor_, pos_);
             lin(output_, h7, dsp_logits_, dspark::kBlock - 1);
             dspark::markov(d, dsp_logits_, n_vocab_, n_vocab_, dsp_block_);
             ++dsp_proposed_;
+            dsp_ms_ += ms_since(dt);
         }
         *prob = 1.f;
         return dsp_block_[std::min(i, dspark::kBlock - 2)];

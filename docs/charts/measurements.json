@@ -1,0 +1,34 @@
+{
+  "machine": "RTX 5070 12 GB, Core Ultra 7 265K, DDR5-5600 32 GB, Windows 11 (HAGS on)",
+  "writing": {
+    "title": "Writing speed, IQ4_XS, 12 GB (0.3.2)",
+    "note": "Temperature 1.0, tokens 17-216 of the answer, after one warm-up answer on the same prompt; one run each.",
+    "rows": [
+      {"context": "8K", "prose": 70.7, "code": 71.5},
+      {"context": "64K", "prose": 54.7, "code": 55.5},
+      {"context": "128K", "code": 44.3},
+      {"context": "256K", "code": 36.6}
+    ]
+  },
+  "reading": {
+    "title": "Reading a prompt from the start, IQ4_XS, 12 GB (0.3.2)",
+    "note": "Source code prompts, nothing reused; prompt batches of 2,048 tokens; one run each.",
+    "rows": [
+      {"length": "4K", "tps": 2565},
+      {"length": "32K", "tps": 2475},
+      {"length": "64K", "tps": 2327},
+      {"length": "128K", "tps": 1997},
+      {"length": "256K", "tps": 1581}
+    ]
+  },
+  "quality": {
+    "title": "Quality at 2K against Unsloth's Q8_K_XL (llama.cpp)",
+    "note": "Mean KLD of the logits over 2,048 positions and the share of positions with the same top token.",
+    "rows": [
+      {"model": "iq4_xs (default)", "kld": 0.0026, "top1": 98.4},
+      {"model": "q3_k_xl", "kld": 0.0090, "top1": 97.2},
+      {"model": "q2_k_xl", "kld": 0.0535, "top1": 93.5},
+      {"model": "iq2_xxs", "kld": 0.0687, "top1": 90.8}
+    ]
+  }
+}

@@ -9,7 +9,9 @@ namespace {
 // The shape of a round's cost by window size, relative to one token, used only for sizes not measured yet (the
 // measured round times replace it). Between the RTX 5070's measured curves: +10 ms per token with every missed expert
 // on the CPU (bench/results/2026-09-27-spec/window-cost), flatter with the default CPU/DMA split.
-constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
+constexpr double kShape8[9] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
+// inkling2 fork: past 8 tokens (kMaxT 64) the shape goes on as its last steps, 0.4 a token
+constexpr double shape(int t) { return t <= 8 ? kShape8[t] : kShape8[8] + 0.4 * (t - 8); }
 constexpr double kCostAlpha = 0.1;    // EMA weight of a new round time
 constexpr double kTokAlpha = 0.05;    // EMA weight of a new MTP window outcome
 constexpr double kDecay = 0.97;       // lookup counts: older windows fade
@@ -44,10 +46,10 @@ double DraftPolicy::cost_ms(int t) const {
     for (int u = 1; u <= kMaxT; ++u)
         if (cost_n_[u] > 0) {
             const double w = std::min(cost_n_[u], 20.0);
-            num += w * cost_[u] * kShape[t] / kShape[u];
+            num += w * cost_[u] * shape(t) / shape(u);
             den += w;
         }
-    return den > 0 ? num / den : kShape[t];
+    return den > 0 ? num / den : shape(t);
 }
 
 bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }

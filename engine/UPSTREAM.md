@@ -231,3 +231,8 @@ Kernel sources the Inkling engine does not build (the Qwen engine's) were not ke
 | `third_party_ggml/*` | `third_party/ggml/*` |
 | `inkling_kernels_test.cu` | `src/poly/inkling_kernels_test.cu` (copied later, for the decode attention timings) |
 | `dspark.cu`, `dspark.hpp` | Strata PR #6506 `engine/src/ik2/ik2_draft.cu` and parts of `ik2_kernels.cu` (MIT, Project Maya contributors), changed: dspark.hpp says how |
+| `inkling_attn_bench.cu` | none (this fork's: timings of the prompt-batch attention and a check of `--kv k8v4`) |
+
+`--kv k8v4` (opt-in, this fork's code): 8-bit keys and 4-bit values follow the idea of NInfer's `rk8v4` KV format (Apache-2.0) and the per-block random rotation before a scalar quantizer follows TurboQuant (MIT, `turboquant` reference code); no code was copied from either. The 4-bit rule is ggml's Q4_0 (MIT, The ggml authors), written here for this plane layout.
+
+The prompt read's embeddings on the host's threads (`INKLING2_EMBED_MT`, on by default) and `--read-mib` / `INKLING2_READ_MIB` (the host memory a read's rows take, by default by the machine's RAM, so that a long prompt is fewer reads and each layer's experts outside VRAM are copied fewer times) follow ideas in kuraneko1/Strata's strata-inkling2 (MIT): its threaded token dequantisation and its prefill staging of only the experts VRAM lacks. No code was copied; both are this fork's code.

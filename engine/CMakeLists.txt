@@ -163,6 +163,18 @@ if(MSVC)
   target_compile_options(inkling2_cpu_bandwidth PRIVATE /arch:AVX2)
 endif()
 
+# the engine's CPU experts called as a written token calls them, without the card (cpu_calls.cpp)
+add_executable(inkling2_cpu_calls cpu_calls.cpp)
+target_link_libraries(inkling2_cpu_calls PRIVATE ink_cpu)
+if(MSVC)
+  target_compile_options(inkling2_cpu_calls PRIVATE /arch:AVX2)
+endif()
+
 # host -> card copy speed from pinned and pageable memory by copy size (the prompt path's expert staging)
 add_executable(inkling2_pcie_bandwidth pcie_bandwidth.cu)
 target_link_libraries(inkling2_pcie_bandwidth PRIVATE CUDA::cudart)
+
+# inkling2 fork (development): a prompt batch's full-layer attention over a long cache, timed apart from the engine
+add_executable(inkling2_attn_bench inkling_attn_bench.cu kernels_inkling.cu kernels.cu)
+target_include_directories(inkling2_attn_bench PRIVATE ${INK_INCLUDE} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(inkling2_attn_bench PRIVATE ink_kernels CUDA::cublas CUDA::cudart)

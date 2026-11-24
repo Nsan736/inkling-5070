@@ -141,7 +141,9 @@ int main(int argc, char** argv) {
             else if (a == "--kv") {
                 const std::string f = val();
                 if (f == "q8_0") o.kv_format = strata::poly::KvFmt::kQ8_0;
-                else if (f != "fp16") throw std::runtime_error("--kv is fp16 or q8_0");
+                else if (f == "k8v4") o.kv_format = strata::poly::KvFmt::kK8V4;
+                else if (f == "k8v4-plain") o.kv_format = strata::poly::KvFmt::kK8V4Plain;
+                else if (f != "fp16") throw std::runtime_error("--kv is fp16, q8_0, k8v4 or k8v4-plain");
             } else if (a == "--expert-profile") o.profile = val();
             else if (a == "--threads") o.threads = std::atoi(val());
             else if (a == "--no-graphs") o.graphs = false;

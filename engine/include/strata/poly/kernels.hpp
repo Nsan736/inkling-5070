@@ -305,6 +305,11 @@ void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int 
 struct Kvq8 {
     const int8_t* codes = nullptr;
     const uint16_t* scales = nullptr;
+    /// inkling2 fork, Inkling's --kv k8v4 (its values only): 4 - two codes a byte, value 2i in byte i's low four
+    /// bits, (code - 8) * scale (ggml Q4_0's rule in this plane layout); wht - each 32-value block was rotated
+    /// before it was quantized (inkling_kernels.hpp), and the attention turns its output back.
+    int bits = 8;
+    bool wht = false;
 };
 
 /// Causal attention for the tokens from position `pos`: token t attends the rows 0 to pos + t, or with `window`

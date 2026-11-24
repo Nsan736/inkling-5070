@@ -25,13 +25,15 @@ constexpr int kRowsPerDownTask = 16;
 constexpr int kMaxFusedRuns = 256;   // fused_runs(): a call's runs of uses (kCpuRows tokens' experts)
 
 // inkling2 fork: NVFP4 rows against Q8_0 activations through cpu_nvfp4.hpp (AVX-VNNI, two rows at once with a
-// prefetch ahead), bit for bit ggml-cpu's sums.  Opt-in (INKLING2_CPU_VNNI=1) on a CPU with AVX-VNNI: alone it reads
-// 72 GB/s where ggml's reads 59 (12 threads of a 265K), but a visit's CPU experts are too few for that to show.
+// prefetch ahead), bit for bit ggml-cpu's sums.  On by default on a CPU with AVX-VNNI (INKLING2_CPU_VNNI=0: ggml's):
+// alone it reads 72 GB/s where ggml's reads 59 (12 threads of a 265K); the engine's calls of 1 to 8 experts at random
+// (inkling2_cpu_calls) 61-71 GB/s where ggml's 51-62, and at 64K a written token 43.0 -> 48.1 tok/s (prose) and
+// 49.0 -> 52.9 (code), each the second answer of two runs; at 8K, where fewer experts are the CPU's, no change.
 constexpr int kNvfp4 = 40, kQ8_0 = 8, kNvfp4Prefetch = 2048;
 bool vnni_rows() {
     static const bool on = [] {
         const char* v = std::getenv("INKLING2_CPU_VNNI");
-        if (!v || std::atoi(v) == 0) return false;
+        if (v && std::atoi(v) == 0) return false;
         int r[4] = {};
         __cpuidex(r, 7, 1);
         return (r[0] & (1 << 4)) != 0;   // CPUID.(EAX=7,ECX=1):EAX[4] AVX-VNNI
@@ -182,6 +184,8 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
     return true;
 }
 
+void (*g_visit_trace)(int tag) = nullptr;
+
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
                  int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
                  const std::function<void()>* meanwhile, const uint8_t* late, const std::function<void(int)>* wait,
@@ -260,7 +264,9 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const int* orderp = order.data();
     const int gu_tasks = (n_ff + kRowsPerTask - 1) / kRowsPerTask;
     const int first = meanwhile ? 1 : 0;   // task 0, so it is taken at once
+    std::atomic<bool> traced{false};
     const auto gu_task = [&](int t) {
+        if (g_visit_trace && !traced.exchange(true, std::memory_order_relaxed)) g_visit_trace(14);
         const int u = orderp[t / gu_tasks], i0 = runp[u], i1 = runp[u + 1];
         if (late && late[byp[i0]]) (*wait)(byp[i0]);
         const CpuExpert& e = experts[byp[i0]];

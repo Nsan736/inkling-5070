@@ -49,11 +49,14 @@ const Names kMetaNames[] = {
 };
 
 // Where a visit's keys and values go, in its planes pl: fp16 keys and values, or q8_0 codes and scales.
-InklingKvDst kv_dst(bool q8, uint8_t* const* pl, int ring) {
+// inkling2 fork: vbits (Inkling::vbits()) 4 or 5 - k8v4's values, 5 rotated
+InklingKvDst kv_dst(bool q8, uint8_t* const* pl, int ring, int vbits = 8) {
     InklingKvDst dst;
     if (q8) {
         dst.kc = (int8_t*) pl[0], dst.ks = (uint16_t*) pl[1];
         dst.vc = (int8_t*) pl[2], dst.vs = (uint16_t*) pl[3];
+        dst.v4 = vbits < 8;
+        dst.v_wht = vbits == 5;
     } else {
         dst.k = (uint16_t*) pl[0], dst.v = (uint16_t*) pl[1];
     }
@@ -62,11 +65,13 @@ InklingKvDst kv_dst(bool q8, uint8_t* const* pl, int ring) {
 }
 
 // The caches the attention of a token at `pos` reads, in the planes pl.
-InklingAttnSeq attn_seq(bool q8, uint8_t* const* pl, int64_t pos, int64_t room) {
+InklingAttnSeq attn_seq(bool q8, uint8_t* const* pl, int64_t pos, int64_t room, int vbits = 8) {
     InklingAttnSeq c;
     if (q8) {
         c.kq8 = Kvq8{(const int8_t*) pl[0], (const uint16_t*) pl[1]};
         c.vq8 = Kvq8{(const int8_t*) pl[2], (const uint16_t*) pl[3]};
+        c.vq8.bits = vbits < 8 ? 4 : 8;
+        c.vq8.wht = vbits == 5;
     } else {
         c.kcache = (const uint16_t*) pl[0];
         c.vcache = (const uint16_t*) pl[1];
@@ -206,8 +211,8 @@ void Inkling::load_geometry() {
     // step()'s rows are a sequence's each, and the _seqs kernels take kInklingSeqRows of them a launch
     if (opt_.batch + 1 > kInklingSeqRows)
         throw std::runtime_error("Inkling 2: --batch takes at most " + std::to_string(kInklingSeqRows - 1));
-    if (opt_.kv_format != KvFmt::kFp16 && opt_.kv_format != KvFmt::kQ8_0)
-        throw std::runtime_error("Inkling 2: the attention cache is fp16 or q8_0");
+    if (opt_.kv_format != KvFmt::kFp16 && !q8())
+        throw std::runtime_error("Inkling 2: the attention cache is fp16, q8_0 or k8v4");
     // A card of a split has a run of physical layers (split_layers()), here its visits: the core's on one card.
     const auto visit = [&](int p) {
         if (p > core_start_ && p < core_end_) throw std::logic_error("Inkling 2: a card starts inside the loop");
@@ -348,11 +353,14 @@ void Inkling::alloc_caches() {
     keep_ = std::min(window_, ring_);
     size_t one = 0;   // a position's bytes in a visit's planes together
     for (int i = 0; i < planes(); ++i) one += plane_row(i);
-    if (q8()) std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", one / 2);
+    if (v4())   // inkling2 fork
+        std::fprintf(stderr, "strata-poly: k8v4 KV cache (q8_0 keys, 4-bit values%s): %zu bytes a position\n",
+                     wht() ? " rotated a block" : "", one);
+    else if (q8()) std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", one / 2);
     // STRATA_KV_INT8=1 reads the q8_0 cache of a decoded token with __dp4a, the queries quantized too (as Kolibri's
     // does).  Opt-in: other arithmetic, so other bits; fp16 caches and prompt batches are unchanged.
     if (const char* e = std::getenv("STRATA_KV_INT8"); e && std::atoi(e) != 0 && !int8_dot_) {
-        int8_dot_ = q8();
+        int8_dot_ = q8() && !v4();
         std::fprintf(stderr, "strata-poly: STRATA_KV_INT8: decode attention %s\n",
                      int8_dot_ ? "through __dp4a on the q8_0 cache" : "unchanged (the cache is not q8_0)");
     }
@@ -504,13 +512,13 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
             uint8_t* pl[4] = {};
             for (int j = 0; j < planes(); ++j) pl[j] = (uint8_t*) seq_buf(r.seq, B.plane[j]);
             float* const conv = seq_state(r.seq, B.conv);
-            kv[i].dst = kv_dst(q8(), pl, ring);
+            kv[i].dst = kv_dst(q8(), pl, ring, vbits());
             kv[i].k_state = conv;
             kv[i].v_state = conv + v_at;
             kv[i].pos = pos[i] = r.pos;
             const int64_t keep = pos_;   // its room as alone (room() reads pos_)
             pos_ = r.pos;
-            at[i] = attn_seq(q8(), pl, r.pos, attn_room(B, 1));
+            at[i] = attn_seq(q8(), pl, r.pos, attn_room(B, 1), vbits());
             pos_ = keep;
         }
         inkling_kv_store_seqs(kraw_, vraw_, kv, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
@@ -525,18 +533,18 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         if (fuse) {
             inkling_kv_store_clip(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv),
                                   B.swa ? nullptr : ktap_, B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_,
-                                  rms_eps_, kv_dst(q8(), B.plane, ring), pos_, k_, v_, jobs, 2, st_, at);
+                                  rms_eps_, kv_dst(q8(), B.plane, ring, vbits()), pos_, k_, v_, jobs, 2, st_, at);
         } else {
             inkling_kv_store(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv),
                              B.swa ? nullptr : ktap_, B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_,
-                             kv_dst(q8(), B.plane, ring), pos_, k_, v_, st_, at);
+                             kv_dst(q8(), B.plane, ring, vbits()), pos_, k_, v_, st_, at);
             inkling_clip_many(jobs, 2, n, pos_, st_, at);
         }
         dump("Qcur", v, q_, hq, n);
         dump("Kcur", v, k_, hk, n);
         dump("Vcur", v, v_, hk, n);
         dump("Rcur", v, rel_, n_head_ * n_rel_, n);
-        const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
+        const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n), vbits());
         const bool pt = pt_now() && n > 16 && !recording_;   // inkling2 fork, INKLING2_PREFILL_TIMES
         if (pt) ck(cudaEventRecord((cudaEvent_t) pt_attn_ev_[0], cs(st_)), "prefill times");
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
@@ -914,6 +922,7 @@ void Inkling::window_runs(int64_t pos, F&& f) const {
 size_t Inkling::plane_row(int i) const {
     const size_t width = (size_t) n_kv_ * head_dim_;
     if (!q8()) return width * sizeof(uint16_t);
+    if (i == 2 && v4()) return width / 2;   // inkling2 fork, k8v4: two 4-bit codes a byte
     return i % 2 == 0 ? width : width / 32 * sizeof(uint16_t);
 }
 

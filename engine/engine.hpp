@@ -52,7 +52,12 @@ struct Likeliest;
 /// quantized.  q8_0 is qwen35moe's; int8 and int8k are Gemma 4's - the two readers are not the same arithmetic,
 /// so a model has one or the other rather than a choice between them.  Auto is resolved from model
 /// geometry before allocation on Metal; other backends default to fp16.
-enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3 };
+/// inkling2 fork: k8v4 (Inkling 2 only, opt-in) keeps q8_0's keys and the values in 4 bits (ggml Q4_0's rule, a
+/// fp16 scale a 32-value block), each block rotated first (signs and a Walsh-Hadamard transform); k8v4-plain is the
+/// same without the rotation, for comparing.  k8v4 is for speed at 256K: the KV 23.5% smaller, so on an RTX 5070
+/// 254 more experts in VRAM and writing +18% (30.4 -> 35.8 tok/s) at 254K; its quality at 128K is just past the
+/// q8_0-relative bar (KLD 1.65x, top-1 -0.78 points; 2K within it), so it stays opt-in (2026-11-24).
+enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kK8V4 = 4, kK8V4Plain = 5 };
 
 struct Options {
 #if defined(STRATA_GPU_METAL)
@@ -90,6 +95,9 @@ struct Options {
                                   ///< below 0: as the two took the time between them; 0: none
     int expert_swaps = 64;        ///< experts on their way into the cache at a time while an answer is written, each
                                   ///< to the slot of one the answer uses less; 0: the cache stays as it was loaded
+    int read_mib = -1;            ///< inkling2 fork: the pinned host memory a read's rows take (kReadBytes), in MiB;
+                                  ///< -1: INKLING2_READ_MIB, else by the machine's RAM (2048 at 30 GiB and more,
+                                  ///< 1024 at 15, else 512), at most a quarter of the RAM that is free
     int64_t ram_experts_mib = -2; ///< the memory this process holds for the experts outside VRAM, answer or not:
                                   ///< the ones used most lately are read into it from the files; the others are left
                                   ///< to the file cache, which gives them to whatever needs the memory, and come back
@@ -562,7 +570,7 @@ protected:
     /// that a layer's head leaves for the layer's tail.
     virtual void shift_rows(ptrdiff_t by);
     /// The tokens of a window of t that leave the recurrent state as it is after them, a bit a token.
-    unsigned snap_tokens(int t) const;
+    uint64_t snap_tokens(int t) const;   // inkling2 fork: 64 bits, for windows of up to 64
     /// The other names of a tensor or a metadata key in the files of this architecture, or null.
     virtual const Names* tensor_alias(const char* name) const { (void) name; return nullptr; }
     virtual const Names* meta_alias(const char* key) const { (void) key; return nullptr; }
@@ -656,6 +664,7 @@ protected:
     /// own block, or kSumRows.  The others keep kSumRows, whose windows past it are routed on the host as before.
     int card_rows() const;
     void moe_add(int n);
+    void vt_gpu(int tag);   ///< inkling2 fork, INKLING2_VISIT_TRACE: the card's clock with a tag, on st_
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
@@ -915,13 +924,13 @@ protected:
     // the last token of the sequence, and the outputs of the tokens of the call under way follow it.
     float* hn_ = nullptr;
     Likeliest* h_guess_ = nullptr;   ///< a guess and its probability, pinned
-    int32_t win_tok_[8] = {};           ///< the window's tokens, for keep()
+    int32_t win_tok_[64] = {};          ///< the window's tokens, for keep() (inkling2 fork: 64, 8 before)
     int64_t ahead_pos_ = -1;            ///< draft() has left the block's row of this position as its token leaves it,
     int32_t ahead_tok_ = 0;             ///< which is this one
     float* snap_ = nullptr;      ///< window(): the recurrent state after tokens of it (snap_tokens()), rec_n_ apart
     int snap_places_ = 0;        ///< how many states it holds
     float* snap_at_ = nullptr;   ///< where the call under way leaves the first of its states
-    unsigned snap_bits_ = 0;     ///< the tokens of the call under way that leave their state, a bit a token
+    uint64_t snap_bits_ = 0;     ///< inkling2 fork: 64 bits; the tokens of the call under way that leave their state, a bit a token
     bool card_parts_ = false;    ///< the next layer_tail()'s experts went through moe_card() with their sum left to it
     bool layers_in_order_ = false;   ///< run()'s layers are under way: a layer's tail is followed by the next one's head
     bool windowed_ = false;      ///< the call under way is a window's
@@ -940,9 +949,9 @@ protected:
         double ms = 0;           ///< what a window took this way, the later ones counting for more
         int n = 0;               ///< how many were timed
     };
-    Way way_[2][9];              ///< [in halves][the window's tokens]
-    int way_calls_[9] = {};      ///< windows of each size since the way behind had one
-    int way_backoff_[9] = {};    ///< the way behind waits kWayAgain << this many windows of the size
+    Way way_[2][65];             ///< inkling2 fork: windows of up to 64 (9 before, for 8); [in halves][the window's tokens]
+    int way_calls_[65] = {};     ///< windows of each size since the way behind had one
+    int way_backoff_[65] = {};   ///< the way behind waits kWayAgain << this many windows of the size
     bool halves_ = false;        ///< the way of the window under way
     float *wlogits_ = nullptr, *h_wlogits_ = nullptr;   ///< a window's logits, token after token: VRAM and pinned
     int cached_ = 0;
@@ -1197,12 +1206,18 @@ protected:
     float* dsp_logits_ = nullptr;                 ///< the block's base logits (device, 7 rows)
     int32_t dsp_block_[8] = {};
     int64_t dsp_proposed_ = 0;
+    double dsp_ms_ = 0;          ///< inkling2 fork: the drafter's host time in all (its blocks, synced)
     void dspark_load();
     void dspark_commit(int n);
 public:
     /// INKLING2_DSPARK: the architecture's head hands tap k (0, 1, 2) of its n rows at pos() here.
     void dspark_tap(int k, const float* rows, int n);
     bool dspark_on() const { return dspark_; }
+    /// inkling2 fork, INKLING2_VISIT_TRACE=FILE: the visits' stamps so far, matched to the host's clock, onto FILE
+    void vt_dump();
+    /// inkling2 fork: the drafter's blocks and their time so far
+    int64_t dspark_blocks() const { return dsp_proposed_; }
+    double dspark_ms() const { return dsp_ms_; }
 protected:
     /// INKLING2_DSPARK: a token's embedding as the model's first layer norms it, into dst (device, n_embd floats).
     virtual void embed_normed(int32_t token, float* dst) { (void) token; (void) dst; }

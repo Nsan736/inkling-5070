@@ -324,7 +324,11 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="4K 文脈の小さな参照で 128K の手順の仕組みだけ確かめる")
     ap.add_argument("--estimate", action="store_true", help="所要時間の目安だけ出す")
     ap.add_argument("--deadline", default=None, help="HH:MM (この PC の時刻)。間に合わない見込みの手順は飛ばす")
+    ap.add_argument("--configs", default=None, help="構成の JSON (既定: bench/data/quality_configs.json)")
     a = ap.parse_args()
+    if a.configs:
+        global CONFIGS
+        CONFIGS = pathlib.Path(a.configs)
     run = Run(a.run or ("smoke" if a.smoke else "main"), a.fresh)
     run.timeout = None
     deadline = None

@@ -3,6 +3,8 @@
   python bench/bench.py                 普段の計測: 生成 (約 200 トークン) と 読み込み (8K トークン)。1 分以内
   python bench/bench.py --long          128K の計測 (指示があったときだけ): 120K まで読んだ状態を復元し、残り 8K の
                                         読み込みと、その後の生成を測る。初回だけ 120K を読んで保存する (数分)
+                                        生成は、その文脈で数えない生成を 1 回してから測る (エキスパートの置き場が
+                                        その文脈に落ち着いてから。起動直後の 1 回目は 1 割ほど遅い)
   python bench/bench.py --restart       エンジンを読み込み直してから測る (ビルドし直したときは自動で読み込み直す)
   python bench/bench.py --stop          常駐サーバーを止める
   オプション: --label 文字列 (CSV のメモ欄)、--reps N (各計測の回数、既定 2)
@@ -288,7 +290,7 @@ def main():
     ap.add_argument("--stop", action="store_true")
     ap.add_argument("--label", default="")
     ap.add_argument("--reps", type=int, default=2)
-    ap.add_argument("--kv", choices=["fp16", "q8_0"], default="q8_0")
+    ap.add_argument("--kv", choices=["fp16", "q8_0", "k8v4", "k8v4-plain"], default="q8_0")
     ap.add_argument("--extra", default="", help='エンジンに足す設定 (例: "--vram-pool")。CSV の engine_flags に残る')
     ap.add_argument("--env", action="append", default=[], help="エンジンに渡す環境変数 K=V (読み込み直す。CSV に残る)")
     ap.add_argument("--lookup", action="store_true",
@@ -428,6 +430,7 @@ def main():
             c.send(f"SAVE {session_120k}")
             print("  " + c.read_until(("SAVED",), LONG_TIMEOUT)[-1] +
                   f"  ファイル {session_120k.stat().st_size / 2**30:.2f} GiB  計 {time.time() - t0:.0f} 秒")
+        warmed_long = False
         for _ in range(0 if a.mtp else a.reps):
             t0 = time.time()
             c.send(f"RESTORE {session_120k}")
@@ -437,6 +440,9 @@ def main():
             if done["reused"] < len(base) or done["read"] != len(tail):
                 raise RuntimeError(f"復元が効いていない: reused={done['reused']} read={done['read']}")
             pres.append(1000.0 * done["read"] / done["prompt_ms"])
+            if not warmed_long:   # the expert cache settles on this context's routing first (not counted)
+                run_gen(c, base + tail, sampling=T1)
+                warmed_long = True
             tps, done_gen = run_gen(c, base + tail)
             gens.append(tps)
             drafts.append((done_gen["drafts_right"], done_gen["drafts"]))

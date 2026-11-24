@@ -1240,7 +1240,18 @@ int serve(Session& ss) {
         std::fflush(stdout);
         // inkling2 fork, for bench/bench.py (off by default): the expert cache after the answer, which the
         // attention caches take VRAM from as the conversation grows (shrink_cache() says nothing itself)
+        engine.vt_dump();   // inkling2 fork, INKLING2_VISIT_TRACE (nothing without it)
         static const bool report_cache = std::getenv("INKLING2_REPORT_CACHE") != nullptr;
+        if (report_cache && engine.dspark_on()) {   // inkling2 fork: the drafter's blocks and time in this answer
+            static int64_t blocks0 = 0;
+            static double ms0 = 0;
+            std::fprintf(stderr, "strata-inkling2: DSpark this answer: %lld blocks, %.1f ms in the drafter (%.2f ms a block), "
+                                 "%lld guesses, %lld right\n", (long long) (engine.dspark_blocks() - blocks0),
+                         engine.dspark_ms() - ms0, (engine.dspark_ms() - ms0) / std::max<int64_t>(1, engine.dspark_blocks() - blocks0),
+                         (long long) r.guessed, (long long) r.guessed_right);
+            blocks0 = engine.dspark_blocks();
+            ms0 = engine.dspark_ms();
+        }
         if (report_cache) {
             const double per = r.produced > 0 ? 1.0 / (double) r.produced : 0.0;   // the answer's tokens
             std::fprintf(stderr, "strata-inkling2: expert cache %d experts (%d when full, %.2f GiB) at %lld tokens, "
@@ -1548,6 +1559,9 @@ void usage() {
                  "                         used most lately; the rest stay in the file cache for other programs to take,\n"
                  "                         and are read back when a token needs them (default: all of them when they\n"
                  "                         fit in the RAM that is free, else what is free less 4 GiB; -1: all of them)\n"
+                 "  --read-mib N           pinned RAM for a long prompt's rows, so that it is read in fewer passes and\n"
+                 "                         the experts outside VRAM are copied fewer times (default: 2048 with 30 GiB\n"
+                 "                         of RAM or more, 1024 with 15, else 512; at most a quarter of the free RAM)\n"
                  "  --lock-experts         lock the experts outside VRAM in RAM, so the system cannot drop them from the\n"
                  "                         file cache when other programs want the memory (Linux: up to ulimit -l)\n"
                  "  --prompt-batch N       prompt tokens read at a time (default 1024); about 1.4 MiB of VRAM each\n"
@@ -1675,8 +1689,11 @@ int main(int argc, char** argv) {
             else if (fmt == "q8_0") o.kv_format = KvFmt::kQ8_0;
             else if (fmt == "int8") o.kv_format = KvFmt::kInt8;
             else if (fmt == "int8k") o.kv_format = KvFmt::kInt8K;
+            else if (fmt == "k8v4") o.kv_format = KvFmt::kK8V4;              // inkling2 fork
+            else if (fmt == "k8v4-plain") o.kv_format = KvFmt::kK8V4Plain;   // inkling2 fork
             else {
-                std::fprintf(stderr, "strata-poly: --kv %s: unknown format (use fp16, q8_0, int8 or int8k)\n",
+                std::fprintf(stderr,
+                             "strata-poly: --kv %s: unknown format (use fp16, q8_0, int8, int8k, k8v4 or k8v4-plain)\n",
                              fmt.c_str());
                 std::exit(2);
             }
@@ -1687,6 +1704,7 @@ int main(int argc, char** argv) {
         else if (a == "--draft-model") o.draft_model = val();
         else if (a == "--expert-swaps") o.expert_swaps = std::atoi(val());
         else if (a == "--ram-experts-mib") o.ram_experts_mib = std::atoll(val());
+        else if (a == "--read-mib") o.read_mib = std::atoi(val());
         else if (a == "--tail-skip") o.tail_skip = std::atoi(val());
         else if (a == "--skip-weight") o.skip_weight = (float) std::atof(val());
         else if (a == "--skip-renorm") o.skip_renorm = true;

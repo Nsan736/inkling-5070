@@ -77,6 +77,9 @@ struct Situ {
 /// `situ`, when given, is the activation in place of both (llama.cpp's LLM_FFN_SITU, Inkling 2's):
 /// beta * tanh(g / beta) * sigmoid(g) * lin_beta * tanh(u / lin_beta), with u as it is when lin_beta <= 0.
 /// `lowbit`: Q2_0's and IQ1_S's dot products are cpu_lowbit.hpp's where the CPU has them, else ggml's.
+/// inkling2 fork, INKLING2_VISIT_TRACE: when set, called with tag 14 as the first gate and up product of a call starts
+extern void (*g_visit_trace)(int tag);
+
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
                  int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
                  const std::function<void()>* meanwhile = nullptr, const uint8_t* late = nullptr,

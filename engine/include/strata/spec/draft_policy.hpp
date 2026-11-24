@@ -21,7 +21,7 @@ namespace strata::spec {
 
 class DraftPolicy {
 public:
-    static constexpr int kMaxT = 8;
+    static constexpr int kMaxT = 64;   // inkling2 fork: 8 before; a copying answer's lookup windows go to --window
     static constexpr int kBuckets = 4;
 
     explicit DraftPolicy(int max_t, double margin = 0.03);

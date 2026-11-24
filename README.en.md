@@ -6,7 +6,7 @@
 > [PolyStrata](https://github.com/simplexai-labs/PolyStrata); it is not part of either project and is not supported
 > by their authors.
 
-> **Status (0.3.1)**
+> **Status (0.3.2)**
 > - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0049, top-1 agreement 97.4% at a 2K
 >   context; mean KLD 0.0075, top-1 96.9% at a 128K context.
 > - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0026, top-1 98.4%.
@@ -35,23 +35,32 @@ Much of the code and documentation was written with the help of AI.
 
 Measured on: RTX 5070 12 GB, Core Ultra 7 265K, DDR5-5600 32 GB, Windows 11, driver 610.60.
 
+**Keep Windows' Hardware-accelerated GPU scheduling (HAGS) on.** With it off, the GPU took 5-6 times as long to start what the host sent it, and writing was 10-20% slower (62-64 -> 54 tok/s at 8K).
+
 ## What to use, by VRAM
 
-Writing speed (temperature 1.0, tok/s): after an 8K prompt, or after reading the last 8K of a saved long context.
+Writing speed (temperature 1.0, tok/s). The 12 GB IQ4_XS row is 0.3.2, measured after one warm-up answer on the same prompt (the first answer after a start is about 10% slower, while the expert cache settles). The other rows are 0.3.1's (after an 8K prompt, or after reading the last 8K of a saved long context).
 
 | VRAM | Choice | 8K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| 12 GB | IQ4_XS (default), 128K | ~67 | ~51 | ~43-45 | 33.6 (`--context 256k`) |
+| 12 GB | IQ4_XS (default), 128K | 70.7-71.5 | 54.7-55.5 | 44.3 | 36.6 (`--context 256k`) |
 | 8 GB | IQ4_XS (quality) | 51.4 | 34.3 | 25.3 | does not fit |
 | 8 GB | Q3_K_XL (speed) | 57.6 | 38.8 | 26.1 | does not fit |
 | 6 GB | IQ4_XS or Q3_K_XL, up to 64K | 35.0 / 39.0 | 19.4 / 22.2 | does not fit | does not fit |
 
 - The figures vary by about ±2% between measuring sessions.
+- 12 GB: prose and code contexts at 8K and 64K, code at 128K and 256K. 256K was measured with the bench settings (2,048-token prompt batches, 400 MiB of VRAM left free).
 - **8 GB / 6 GB:** measured on this RTX 5070 with its VRAM limited by `--vram-reserve-mib` (not on real cards), with
   2,048-token prompt batches. setup picks 1,024 / 512 for those cards, which leaves more VRAM for experts, so writing
   should be faster than this (not measured).
 - **Context:** setup picks 32K on 8 GB and 16K on 6 GB; for the lengths above use e.g. `setup.bat --context 128k`.
 - **Long contexts narrow the gaps:** the KV cache takes the experts' VRAM and most of them run on the CPU.
+
+![Writing speed](docs/charts/writing.png)
+
+![Reading speed](docs/charts/reading.png)
+
+The charts are drawn from `docs/charts/measurements.json` by `python docs/charts/make_charts.py`.
 
 ### Quality and speed of each model
 
@@ -59,20 +68,22 @@ Quality: 2K context against Unsloth's Q8_K_XL logits (llama.cpp); a lower KLD is
 
 | Model (`--model`) | File | Mean KLD | Top-1 | 12 GB writing (8K / 128K) |
 |---|---|---|---|---|
-| `iq4_xs` (default) | 15.7 GB | 0.0026 | 98.4% | ~67 / ~43-45 |
+| `iq4_xs` (default) | 15.7 GB | 0.0026 | 98.4% | 70.7 / 44.3 (0.3.2) |
 | `q3_k_xl` | 13.6 GB | 0.0090 | 97.2% | 69.0 / 45.1 |
 | `q2_k_xl` | 9.1 GB | 0.0535 | 93.5% | 74.0 / 45.4 |
 | `iq2_xxs` | 8.5 GB | 0.0687 | 90.8% | 79.9 / 51.6 |
 
-- Speeds vary by about ±2% between measuring sessions.
+- Speeds vary by about ±2% between measuring sessions. All but IQ4_XS are 0.3.1's.
 - Q2_K_XL and IQ2_XXS are fast, but their measured quality drop is large (KLD about 20-26x IQ4_XS's); setup says so
   when one is chosen.
 - The smaller models come from the same Unsloth repository and revision, SHA-256 checked.
 
+![Quality](docs/charts/quality.png)
+
 ### 256K (12 GB)
 
 `setup.bat --context 256k` (setup then uses 1,024-token prompt batches and leaves 200 MiB free). After reading the
-last 8K of a ~245K-token context:
+last 8K of a ~245K-token context (0.3.1):
 
 | Model | Experts in VRAM | Writing (temperature 1.0) | Reading the last 8K |
 |---|---|---|---|
@@ -85,17 +96,17 @@ tok/s (IQ2_XXS).
 
 ## Speed on that PC (IQ4_XS, 12 GB)
 
-One request; 200 tokens after the first 16. 128K = a 120K-token code context plus 8K more.
+One request; 200 tokens after the first 16. This engine's temperature-1.0 writing and its prompt reads are 0.3.2, after one warm-up answer on the same prompt; the greedy rows and NInfer are 0.3.1's. 128K writing: after a 128K code context.
 
 | | This engine | NInfer 2026-11-22.2 (Windows) |
 |---|---|---|
-| 8K, temperature 1.0 | ~67 tok/s | 49.7 tok/s |
+| 8K, temperature 1.0 | 70.7 tok/s | 49.7 tok/s |
 | 8K, greedy | 68.9 tok/s | 51.5 tok/s |
 | 8K, greedy + lookup drafting | 69.7 tok/s | |
-| 8K prompt | 2,247 tok/s | 2,171 tok/s |
-| 128K, temperature 1.0 | ~43-45 tok/s | 26.2 tok/s |
+| 8K prompt | 2,247 tok/s (0.3.1; 0.3.2: 2,565 at 4K, 2,475 at 32K) | 2,171 tok/s |
+| 128K, temperature 1.0 | 44.3 tok/s | 26.2 tok/s |
 | 128K, greedy | 42.9 tok/s | 26.3 tok/s |
-| 128K prompt (whole context) | 1,738 tok/s | 663 tok/s |
+| 128K prompt (whole context) | 1,997 tok/s | 663 tok/s |
 | CPU while writing | 7-8 cores | ~10 cores |
 
 - This engine's figures vary by about ±2% between measuring sessions.
@@ -109,6 +120,21 @@ One request; 200 tokens after the first 16. 128K = a 120K-token code context plu
 - A conversation's next turn reuses the start it shares with the last one: turn 2 of a 32K conversation read in
   0.23 s (15.6 s read again from the start).
 - More: [docs/measurements.md](docs/measurements.md)
+
+## For long contexts: a 4-bit V cache (a little lower quality)
+
+`--kv k8v4` keeps the attention's values in 4 bits (each block of 32 rotated by a Walsh-Hadamard transform before it is quantized) and its keys in 8 bits. The KV cache is about a fifth smaller than the default (`q8_0`), and the VRAM goes to experts. Off by default; to use it, set `--kv` to `k8v4` in `args` in `config\inkling.json`.
+
+| | default (q8_0) | k8v4 |
+|---|---|---|
+| KV a token | 17,408 bytes | 13,312 bytes |
+| Experts in VRAM at 256K | 673 | 927 |
+| Writing at 256K (temperature 1.0) | 30.4 tok/s | 35.8 tok/s |
+| 2K KLD vs Q8 | 0.0026 | 0.0049 |
+| 128K KLD vs llama.cpp / top-1 | 0.0075 / 96.9% | 0.0124 / 96.1% |
+
+- The 256K speeds were measured in 0.3.1's time (the first answer after a start); they compare runs of one session.
+- At 128K its quality drop is a little past this project's bar (1.5x the default's KLD). It is a choice for speed at 256K.
 
 ## Faster, approximate: expert skipping
 

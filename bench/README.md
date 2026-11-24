@@ -8,6 +8,13 @@
 | 品質の確認 (採用を記録する前に 1 回) | `python -I bench/quality.py --label メモ` | 約 1 分 |
 | 常駐サーバーを止める | `python -I bench/bench.py --stop` | |
 | 品質確認タスク (無人、2K + 128K) | `python -I bench/quality_all.py` (`--estimate` で目安だけ) | 初回は参照作りを含め約 2 時間 10 分 |
+| 文脈の長さごとの生成 (ウォームアップ後) | `python -I bench/dspark_probe.py --ctx 8k 64k --modes base` | 8K で約 1 分、64K で約 3 分 |
+| 最初から読む速さ | `python -I bench/full_reads.py --len 4k 32k 64k 128k` | 約 5 分 |
+| 入力を写す編集の依頼 (lookup の窓) | `python -I bench/copy_window.py --windows 8 16` | 約 5 分 |
+| 生成の 1 回の訪問の時刻 | `INKLING2_VISIT_TRACE=ファイル` で記録し `python -I bench/visit_trace.py ファイル` | |
+
+速度の比較は、起動直後の 1 回目ではなく、同じエンジンで 1 回答えさせてから測る (1 回目はエキスパートの
+キャッシュが落ち着く前で 1 割ほど遅い)。bench.py と上のスクリプトはそうしている。
 
 - 品質確認タスク: 構成は `bench/data/quality_configs.json` (名前、kv、環境変数 env、エンジンの設定 extra)。暫定採用の構成を
   足して実行する。q8_0 は比較の基準として必ず入る。進み具合は `bench/quality_runs/main/run.log` (最後の行が「完了」か
