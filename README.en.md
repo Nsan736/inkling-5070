@@ -159,6 +159,7 @@ experts are in VRAM (8K). Quality at 128K was not measured.
 - Driver 580+ (CUDA 13)
 - RAM 16 GB+, 32 GB recommended (up to 9 GB of experts in RAM; with less, experts are read from the SSD and
   writing slows down)
+  Up to 2 GB of host memory is pinned for reading long prompts (Task Manager shows it as shared GPU memory).
 - ~20 GB free disk for IQ4_XS and the image encoder (10-15 GB for the smaller models)
 - Python 3.10+ (setup creates a venv and installs the server's packages into it)
 
