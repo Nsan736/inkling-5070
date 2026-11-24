@@ -29,6 +29,7 @@ const char* const kUsage =
     "  --max-context N        the engine's context (default 4096)\n"
     "  --prompt-batch N       the prompt's tokens a call\n"
     "  --kv fp16|q8_0         the attention cache's format (default fp16)\n"
+    "  --loops N              Inkling 2: the core's passes, 1 to 3 (default: the file's)\n"
     "  --expert-profile FILE  the expert cache's profile, as strata-poly's\n"
     "  --threads N            the CPU experts' threads\n"
     "  --no-graphs            no recorded launches\n"
@@ -146,6 +147,7 @@ int main(int argc, char** argv) {
                 else if (f != "fp16") throw std::runtime_error("--kv is fp16, q8_0, k8v4 or k8v4-plain");
             } else if (a == "--expert-profile") o.profile = val();
             else if (a == "--threads") o.threads = std::atoi(val());
+            else if (a == "--loops") o.loops = std::atoi(val());   // inkling2 fork
             else if (a == "--no-graphs") o.graphs = false;
             else if (a == "--no-gpu-experts") o.gpu_experts = false;
             else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());

@@ -663,6 +663,8 @@ uint64_t session_binds(const Engine& engine) {
         b.bytes("tail", data + (size - edge), edge);
     }
     b.i64("kv", engine.kv_format());
+    // inkling2 fork: a run with fewer passes (--loops) has other rows; the default's binding is as before
+    if (engine.loops() != 0 && engine.loops() != engine.loops_of_file()) b.i64("loops", engine.loops());
     b.u64("row", engine.row_bytes());
     b.u64("state", engine.state_bytes());
     return b.digest();
@@ -1543,6 +1545,8 @@ void usage() {
                  "                         as a CUDA graph and replayed)\n"
                  "  --kv-whole             give the attention caches VRAM for the whole context at load (default: as\n"
                  "                         the conversation grows, the expert cache having the rest until then)\n"
+                 "  --loops N              Inkling 2: run layers 6 to 17 N times (1 to 3), an approximation that\n"
+                 "                         writes faster; a session file is bound to it (default: the file's 3)\n"
                  "  --kv fmt               the K and V attention caches' format, opt-in: fp16 (default,\n"
                  "                         unchanged); q8_0 (ggml Q8_0 blocks: half the KV VRAM, slightly\n"
                  "                         different answers; qwen35moe's, kolibri1's and Flint's); int8 / int8k (Gemma 4's:\n"
@@ -1699,6 +1703,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--window") o.window = std::atoi(val());
+        else if (a == "--loops") o.loops = std::atoi(val());   // inkling2 fork
         else if (a == "--lookup") lookup = std::atoi(val());
         else if (a == "--no-draft") o.draft = false;
         else if (a == "--draft-model") o.draft_model = val();

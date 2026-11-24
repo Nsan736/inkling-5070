@@ -141,6 +141,9 @@ struct Options {
     int batch = 0;                ///< sequences beside the first, each with a state and caches of its own (bind(),
                                   ///< step()); 0: one sequence
     bool batch_mtp = false;       ///< step() takes a guess beside each sequence's token (steps_guesses())
+    int loops = 0;                ///< inkling2 fork: the passes of a looped model's core (Inkling 2: layers 6 to 17),
+                                  ///< fewer than its file's, an approximation (--loops); 0: the file's (3)
+    int loops_of_file = 0;        ///< set by load(): the file's passes, for a session file's binding
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -281,6 +284,9 @@ public:
     std::vector<std::pair<const uint8_t*, size_t>> model_views() const;
     /// --kv as load() settled it, as a number: a session file is bound to it.
     int kv_format() const { return (int) opt_.kv_format; }
+    /// inkling2 fork: --loops as asked (0: the file's), and the file's passes (0 for a model without a loop)
+    int loops() const { return opt_.loops; }
+    int loops_of_file() const { return opt_.loops_of_file; }
     /// What --kv asked for, in the two short forms an architecture's code reads: the int8 codes/delta cache
     /// (both sides, or the keys' side alone under int8k).
     bool int8() const { return opt_.kv_format == KvFmt::kInt8 || opt_.kv_format == KvFmt::kInt8K; }

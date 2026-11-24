@@ -150,12 +150,20 @@ void Inkling::load_geometry() {
     n_passes_ = shape_i("loop.count");
     // ggml-org's block_count is the physical layers, unsloth's every visit
     n_phys_ = unsloth_ ? n_layer_ - (n_passes_ - 1) * (core_end_ - core_start_) : n_layer_;
+    // inkling2 fork: --loops runs fewer passes of the core than the file's.  The weights are the same every pass
+    // (loop.varying is 0), so a pass fewer is its 12 visits fewer: the last pass's output goes to layer 18 as
+    // before, and a single pass has no messages (B.pass stays 0).
+    opt_.loops_of_file = n_passes_;
+    if (opt_.loops != 0) {
+        need(opt_.loops >= 1 && opt_.loops <= n_passes_, "--loops is 1 to the file's loop.count");
+        n_passes_ = opt_.loops;
+    }
     rank_ = shape_i("loop.gate_rank");
     const MetaValue* varying = find("loop.varying");
     need(!varying || varying->u == 0, "a loop whose passes vary (inkling2_loop.loop.varying)");
     need(shape_i("attn_res.block_size") == kBlockSize, "attn_res.block_size is not 6");
     // the streams in r_ hold four blocks and one block of the pass before: Inkling 2 Mini's shape
-    need(n_phys_ == 24 && core_start_ == 6 && core_end_ == 18 && n_passes_ >= 2 && n_passes_ <= kMaxPasses,
+    need(n_phys_ == 24 && core_start_ == 6 && core_end_ == 18 && n_passes_ >= (opt_.loops ? 1 : 2) && n_passes_ <= kMaxPasses,
          "a loop other than layers 6 to 17 of 24, or a bad loop.count");
     // the controllers' decode kernel holds the rank's values in a warp's registers (inkling_control_fused())
     if (rank_ <= 0 || rank_ > kInklingMaxRank)

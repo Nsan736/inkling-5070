@@ -151,6 +151,13 @@ experts in VRAM are always computed). The output changes; off by default. Add it
 The percentages compare runs of one session; the figures vary by about ±2% between sessions. Little gain where most
 experts are in VRAM (8K). Quality at 128K was not measured.
 
+### Experimental: loop count (`--loops N`)
+
+`--loops N` (1 to 3, default 3) runs the loop layers (6 to 17) fewer times. It is faster (8K writing: about 1.2x with
+2, about 1.8x with 1), but the answers break down, so it is not for everyday use (2K KLD: 3 loops 0.0026 / 2 loops 0.70
+/ 1 loop 0.87). A session saved with one loop count does not load with another. It is an experiment, for a model
+trained with a different loop count.
+
 ## Requirements
 
 - Windows 10/11 x64

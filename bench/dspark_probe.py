@@ -8,7 +8,7 @@
 エンジンの報告 (INKLING2_REPORT_CACHE) から、書いたトークンあたりの CPU のエキスパート、命中率、ドラフターの時間を読む。
 結果は bench/logs/dspark_probe.jsonl に 1 行ずつ足す。
 
-使い方: python -I bench/dspark_probe.py [--ctx 8k 64k] [--modes base dspark] [--env K=V ...]
+使い方: python -I bench/dspark_probe.py [--ctx 8k 64k] [--modes base dspark] [--env K=V ...] [--extra "--loops 2"]
 """
 import argparse
 import json
@@ -76,6 +76,7 @@ def main():
     ap.add_argument("--no-lookup", action="store_true", help="lookup=0 for the answers")
     ap.add_argument("--threads", type=int, default=0, help="--threads (0: bench.py's)")
     ap.add_argument("--reserve", type=int, default=0, help="--vram-reserve-mib (0: bench.py's)")
+    ap.add_argument("--extra", default="", help='engine flags to add (e.g. "--loops 2")')
     a = ap.parse_args()
     extra_env = dict(x.split("=", 1) for x in a.env)
     tok = C.strata_tokenizer.Tokenizer.from_dir(C.PUB / "data" / "tokenizer")
@@ -100,7 +101,7 @@ def main():
             if a.reserve:
                 flags[flags.index("--vram-reserve-mib") + 1] = str(a.reserve)
             since = log_path.stat().st_size if log_path.exists() else 0
-            e = U.Engine([str(B.EXE), "--model", str(B.MODEL), "--serve"] + flags + ["--kv", "q8_0"], log=LOG)
+            e = U.Engine([str(B.EXE), "--model", str(B.MODEL), "--serve"] + flags + ["--kv", "q8_0"] + a.extra.split(), log=LOG)
             try:
                 e.gen(16, "temperature=0", U.ids("gen.ids"))   # warm-up (not counted)
                 for t in a.tasks:
