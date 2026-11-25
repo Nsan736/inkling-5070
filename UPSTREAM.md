@@ -58,6 +58,14 @@ environment variable is set.
     writing +18% there, quality at 128K a little past this project's bar (KLD 0.0075 -> 0.0124).
   - Measurement switches: `INKLING2_VISIT_TRACE` (a written token's visits stamped on the card and the host),
     `inkling2_cpu_calls`, `INKLING2_READ_MIB`.
+- 0.3.3:
+  - `--loops N` (experimental, 1 to the file's 3): the loop's layers (6 to 17) run N times, an approximation; a
+    session file saved with another count is bound to it.
+  - `sys_at=POS` (the server sends it unless `STRATA_SYS_CHECKPOINT=0`): a checkpoint where the prompt's first turn
+    ends, kept when the others are thinned and written to a session file, so a compacted conversation goes on from
+    its system prompt and tools (60K: 6,977 tokens read -> 62).
+  - setup writes `--window 32` (8 before).
+  - Measurement switch: `INKLING2_ROUTE_LOG` (a written token's picks, a line a visit).
 - `inkling2_logits_dump`, `inkling2_cpu_bandwidth` and `inkling2_pcie_bandwidth` for the quality checks and
   measurements.
 
