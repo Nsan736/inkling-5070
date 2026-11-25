@@ -122,6 +122,7 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
   - After an agent compacts the conversation, the system prompt and the tool definitions are not read again either
     (a checkpoint that is never dropped sits where the first turn ends). In a 60K conversation the turn after a
     compaction read 62 tokens instead of 6,977 (0.4 s instead of 4.2 s). `STRATA_SYS_CHECKPOINT=0` turns this off.
+    The same holds after a saved session (`/slots`) is restored: the 60K conversation read 62 tokens.
   - Send the tool definitions from the first turn on: adding them later changes the start, which is then read again.
 - When an answer copies text from the conversation (a file being edited), the engine guesses up to 31 tokens of what
   follows and checks them at once (`--window 32`; 8 up to 0.3.2). Edit requests at 64K and 100K wrote 5-14% faster

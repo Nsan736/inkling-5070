@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--label", default="")
     ap.add_argument("--tools-always", action="store_true", help="the tools in every turn (as an agent sends them)")
+    ap.add_argument("--save", default="", help="after turn 4, save the conversation (/slots/0, slot_save_path) and stop")
+    ap.add_argument("--restore", default="", help="restore this saved conversation, then only turn 5")
     a = ap.parse_args()
     tok = C.strata_tokenizer.Tokenizer.from_dir(C.PUB / "data" / "tokenizer")
     filler = tok.decode((U.ids("long_code_base.ids") + U.ids("long_code_tail.ids"))[:a.ctx])
@@ -86,21 +88,33 @@ def main():
             f.write(json.dumps(row) + "\n")
         return r["choices"][0]["message"]
 
-    reply = turn(1, msgs)
-    msgs.append(reply)
-    msgs.append({"role": "user", "content": asks[1]})
-    reply = turn(2, msgs, TOOLS)
-    msgs.append(reply)
-    calls = reply.get("tool_calls") or []
-    if calls:
-        for c in calls:
-            msgs.append({"role": "tool", "tool_call_id": c.get("id", "call_0"), "content": "written"})
+    def slot(action, name):
+        req = urllib.request.Request(f"http://127.0.0.1:{a.port}/slots/0?action={action}",
+                                     json.dumps({"filename": name}).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            print(f"{action}: {r.read().decode()[:300]}", flush=True)
+
+    if a.restore:
+        slot("restore", a.restore)
     else:
-        msgs.append({"role": "user", "content": "Thanks."})
-    reply = turn(3, msgs, TOOLS)
-    msgs.append(reply)
-    msgs.append({"role": "user", "content": asks[3]})
-    turn(4, msgs, TOOLS)
+        reply = turn(1, msgs)
+        msgs.append(reply)
+        msgs.append({"role": "user", "content": asks[1]})
+        reply = turn(2, msgs, TOOLS)
+        msgs.append(reply)
+        calls = reply.get("tool_calls") or []
+        if calls:
+            for c in calls:
+                msgs.append({"role": "tool", "tool_call_id": c.get("id", "call_0"), "content": "written"})
+        else:
+            msgs.append({"role": "user", "content": "Thanks."})
+        reply = turn(3, msgs, TOOLS)
+        msgs.append(reply)
+        msgs.append({"role": "user", "content": asks[3]})
+        turn(4, msgs, TOOLS)
+        if a.save:
+            slot("save", a.save)
+            return
     # after a compaction: the middle of the conversation becomes one summary
     turn(5, [msgs[0], {"role": "user", "content": "Summary of the conversation so far: we read inventory.py, fixed "
                                                     "value_of_hinges to skip negative prices and added low_items."},

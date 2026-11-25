@@ -204,7 +204,8 @@ public:
     // Of the conversation's checkpoints a file has the last two: where its last turn began and the end of its
     // prompt, which is where its next turn goes on from when not from its end.  A state is 63 MiB of Qwen3.6's,
     // and with all of them the file of a 24K conversation was half states.  An edit before those two is read
-    // from the start after a restore.
+    // from the start after a restore.  inkling2 fork: sys_at()'s checkpoint, where the first turn ends, is written
+    // too when it is an earlier one, so a conversation compacted after a restore goes on from there.
     struct Saved {
         uint64_t row_bytes, state_bytes, tokens, prompt, marks, piece_rows;
     };
@@ -226,7 +227,8 @@ public:
         const Saved head{row, state, (uint64_t) n, (uint64_t) s.prompt, marks_saved(s), (uint64_t) per};
         const std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[std::max((size_t) per * row, state)]);
         if (n < 1 || !buf || !put(&head, sizeof head) || !put(s.seq.data(), (size_t) n * 4)) return false;
-        for (size_t k = first_saved(s); k < s.marks.size(); ++k) {
+        const size_t sys = sys_saved(s);
+        for (size_t k = sys != SIZE_MAX ? sys : first_saved(s); k < s.marks.size(); k = k == sys ? first_saved(s) : k + 1) {
             const Checkpoint& m = s.marks[k];
             if (!m.state->data() || !put(&m.pos, 8) || !put(m.state->data(), state)) return false;
         }
@@ -373,7 +375,17 @@ private:
         const size_t keep = at_end(s) ? 3 : 2;
         return s.marks.size() > keep ? s.marks.size() - keep : 0;
     }
-    static uint64_t marks_saved(const Slot& s) { return s.marks.size() - first_saved(s) + (at_end(s) ? 0 : 1); }
+    // inkling2 fork: sys_at()'s checkpoint, when it is one of s's before those, is saved too, ahead of them
+    // (the file's checkpoints stay in order, so an engine without this reads the file as before).
+    size_t sys_saved(const Slot& s) const {
+        const size_t first = first_saved(s);
+        for (size_t k = 0; sys_ > 0 && k < first; ++k)
+            if (s.marks[k].pos == sys_) return k;
+        return SIZE_MAX;
+    }
+    uint64_t marks_saved(const Slot& s) const {
+        return s.marks.size() - first_saved(s) + (at_end(s) ? 0 : 1) + (sys_saved(s) != SIZE_MAX ? 1 : 0);
+    }
 
     static int64_t common(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
         size_t n = 0;
