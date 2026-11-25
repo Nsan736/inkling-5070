@@ -555,9 +555,11 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n), vbits());
         const bool pt = pt_now() && n > 16 && !recording_;   // inkling2 fork, INKLING2_PREFILL_TIMES
         if (pt) ck(cudaEventRecord((cudaEvent_t) pt_attn_ev_[0], cs(st_)), "prefill times");
+        if (n == 1) vt_gpu(45);   // inkling2 fork, INKLING2_VISIT_TRACE: a token's attention, from here to 46
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
                        scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_, at, fuse ? gate_ : nullptr,
                        fuse ? attq_ : nullptr);
+        if (n == 1) vt_gpu(46);
         if (pt) {
             ck(cudaEventRecord((cudaEvent_t) pt_attn_ev_[1], cs(st_)), "prefill times");
             pt_attn_set_ = true;

@@ -66,6 +66,16 @@ environment variable is set.
     its system prompt and tools (60K: 6,977 tokens read -> 62).
   - setup writes `--window 32` (8 before).
   - Measurement switch: `INKLING2_ROUTE_LOG` (a written token's picks, a line a visit).
+- 0.3.4 (each on by default, `=0` off):
+  - `INKLING2_GPU_TOKEN`: a token alone runs its 48 visits as one CUDA graph, routed on the card (the split's
+    kernels); a visit with picks outside VRAM rings a bell in pinned host memory that a host thread answers with the
+    CPU experts' sum, which a kernel waits for and adds. The mapped-memory doorbell follows Strata 0.2.21's Inkling
+    engine (MIT) and skyne98/inkling-ingine-3090 (Apache-2.0): the idea, no code taken. 100K, no lookup: 46.9 -> 54.7 tok/s.
+  - `INKLING2_SLOT_ORDER`: the layers whose expert size few layers share (Inkling 2's 20 to 23) get their cache slots
+    first, so a cut as the context grows takes NVFP4 slots, whose experts can move.
+  - `INKLING2_FAST_PICK`: the whole vocabulary's softmax for a draw in AVX2 floats, by blocks of 256.
+  - Opt-in: `--vram-experts N`, `INKLING2_ATTN_SPLITS`, `INKLING2_LOOP_WEIGHT` / `INKLING2_SWAP_HALF` /
+    `INKLING2_SWAP_GAIN`; measurement: the token graph's stamps under `INKLING2_VISIT_TRACE`, the report's steps.
 - `inkling2_logits_dump`, `inkling2_cpu_bandwidth` and `inkling2_pcie_bandwidth` for the quality checks and
   measurements.
 

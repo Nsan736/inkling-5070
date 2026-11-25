@@ -24,6 +24,23 @@ fit in VRAM; the others are computed on the CPU from RAM.
 Quality, against llama.cpp 690b87d's logits (KV fp16) for 1,023 positions of a 2,048-token text: mean KLD 0.00491,
 top-1 agreement 97.36%, perplexity 3.518 against llama.cpp's 3.516.
 
+## 0.3.4 (November 25, 2026)
+
+Measured warm, temperature 1.0, tokens 17-216, new code written after a source-code context (`bench/chart_runs.py`),
+one run each (100K: the mean of two). "0.3.2" is this engine with `INKLING2_GPU_TOKEN=0 INKLING2_SLOT_ORDER=0
+INKLING2_FAST_PICK=0` and `--window 8` (0.3.2's decode), measured the same day. The numbers are in
+`docs/charts/measurements.json`.
+
+| Context | 0.3.2, lookup | 0.3.2, no lookup | 0.3.4, lookup | 0.3.4, no lookup | Read (0.3.2 / 0.3.4) |
+|---|---|---|---|---|---|
+| 8K | 67.0 | 65.3 | 84.7 | 81.2 | 2,476 / 2,465 |
+| 64K | 56.8 | 52.0 | 68.6 | 64.0 | 2,306 / 2,304 |
+| 100K | 53.7 | 47.6 | 61.6 (63.3 / 59.8) | 57.2 (52.3 / 62.2) | 2,159 / 2,103 |
+| 128K | 44.2 | 45.0 | 51.2 | 51.2 | 1,967 / 1,978 |
+
+Quality (IQ4_XS, KV q8_0): 2K against Q8_K_XL mean KLD 0.00298, top-1 98.04%; against llama.cpp 0.00528 / 97.65% at
+2K and 0.00812 / 96.68% at 128K. With `--kv k8v4` as well: 128K 0.01119 / 95.50%.
+
 ## 0.3.2 (November 24, 2026)
 
 Measured warm: each answer after one uncounted answer on the same prompt in the same engine (the first answer after

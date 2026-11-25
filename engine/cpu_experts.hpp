@@ -59,6 +59,9 @@ struct CpuExpert {
 
 /// Checks that ggml-cpu has a dot product for both types.  Call once per layer format at load.
 bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::string& err);
+/// inkling2 fork, INKLING2_FAST_PICK (on by default): exp((logits[i] - max) * inv_t) for n logits into p (AVX2, float), the sums of
+/// blocks of 256 into blk ((n + 255) / 256 of them); returns their total.
+double softmax_blocks(const float* logits, int n, float inv_t, float* p, double* blk);
 
 /// cpu_experts()'s SiTU activation (llama.cpp's LLM_FFN_SITU, Inkling 2's): its beta and linear beta.
 struct Situ {

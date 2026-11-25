@@ -1,34 +1,172 @@
 {
-  "machine": "RTX 5070 12 GB, Core Ultra 7 265K, DDR5-5600 32 GB, Windows 11 (HAGS on)",
-  "writing": {
-    "title": "Writing speed, IQ4_XS, 12 GB (0.3.2)",
-    "note": "Temperature 1.0, tokens 17-216 of the answer, after one warm-up answer on the same prompt; one run each.",
-    "rows": [
-      {"context": "8K", "prose": 70.7, "code": 71.5},
-      {"context": "64K", "prose": 54.7, "code": 55.5},
-      {"context": "128K", "code": 44.3},
-      {"context": "256K", "code": 36.6}
+ "machine": {
+  "en": "RTX 5070 12 GB, Core Ultra 7 265K, DDR5-5600 32 GB, Windows 11 (HAGS on), IQ4_XS, KV q8_0",
+  "ja": "RTX 5070 12 GB、Core Ultra 7 265K、DDR5-5600 32 GB、Windows 11（HAGS オン）、IQ4_XS、KV q8_0"
+ },
+ "decode": {
+  "contexts": [
+   "8K",
+   "64K",
+   "100K",
+   "128K"
+  ],
+  "series": [
+   {
+    "version": "0.3.2",
+    "lookup": false,
+    "values": [
+     65.3,
+     52.0,
+     47.6,
+     45.0
     ]
-  },
-  "reading": {
-    "title": "Reading a prompt from the start, IQ4_XS, 12 GB (0.3.2)",
-    "note": "Source code prompts, nothing reused; prompt batches of 2,048 tokens; one run each.",
-    "rows": [
-      {"length": "4K", "tps": 2565},
-      {"length": "32K", "tps": 2475},
-      {"length": "64K", "tps": 2327},
-      {"length": "128K", "tps": 1997},
-      {"length": "256K", "tps": 1581}
+   },
+   {
+    "version": "0.3.2",
+    "lookup": true,
+    "values": [
+     67.0,
+     56.8,
+     53.7,
+     44.2
     ]
-  },
-  "quality": {
-    "title": "Quality at 2K against Unsloth's Q8_K_XL (llama.cpp)",
-    "note": "Mean KLD of the logits over 2,048 positions and the share of positions with the same top token.",
-    "rows": [
-      {"model": "iq4_xs (default)", "kld": 0.0026, "top1": 98.4},
-      {"model": "q3_k_xl", "kld": 0.0090, "top1": 97.2},
-      {"model": "q2_k_xl", "kld": 0.0535, "top1": 93.5},
-      {"model": "iq2_xxs", "kld": 0.0687, "top1": 90.8}
+   },
+   {
+    "version": "0.3.4",
+    "lookup": false,
+    "values": [
+     81.2,
+     64.0,
+     57.2,
+     51.2
     ]
+   },
+   {
+    "version": "0.3.4",
+    "lookup": true,
+    "values": [
+     84.7,
+     68.6,
+     61.6,
+     51.2
+    ]
+   }
+  ],
+  "note": {
+   "en": "Writing new code after a source-code context, temperature 1.0, tokens 17-216, after one uncounted answer in the same engine (bench/chart_runs.py). One run each; 0.3.4 at 100K is the mean of two (61.6: 63.3 / 59.8; 57.2: 52.3 / 62.2). \"0.3.2\" is this engine with INKLING2_GPU_TOKEN / SLOT_ORDER / FAST_PICK =0 and --window 8 (0.3.2's decode).",
+   "ja": "コードの前置きの後に新しいコードを書く依頼、温度 1.0、17〜216 トークン目、同じエンジンで 1 回答えさせた後（bench/chart_runs.py）。1 回ずつ。0.3.4 の 100K は 2 回の平均（61.6：63.3 / 59.8、57.2：52.3 / 62.2）。「0.3.2」は、このエンジンで INKLING2_GPU_TOKEN / SLOT_ORDER / FAST_PICK を =0、--window 8 にしたもの（0.3.2 と同じデコード）。"
   }
+ },
+ "reading": {
+  "contexts": [
+   "8K",
+   "64K",
+   "100K",
+   "128K"
+  ],
+  "series": [
+   {
+    "version": "0.3.2",
+    "values": [
+     2476,
+     2306,
+     2159,
+     1967
+    ]
+   },
+   {
+    "version": "0.3.4",
+    "values": [
+     2465,
+     2304,
+     2103,
+     1978
+    ]
+   }
+  ],
+  "note": {
+   "en": "Reading the same prompts from the start (nothing reused), prompt batches of 2,048 tokens, one run each (100K 0.3.4: mean of two). Reading did not change in 0.3.4.",
+   "ja": "同じ依頼を最初から読む（再利用なし）、読み込みの単位 2,048 トークン、1 回ずつ（100K の 0.3.4 は 2 回の平均）。読み込みは 0.3.4 で変わっていない。"
+  }
+ },
+ "quality": {
+  "rows": [
+   {
+    "model": "iq4_xs 0.3.4",
+    "kld": 0.00298,
+    "top1": 98.04
+   },
+   {
+    "model": "iq4_xs 0.3.2",
+    "kld": 0.00258,
+    "top1": 98.44
+   },
+   {
+    "model": "q3_k_xl",
+    "kld": 0.009,
+    "top1": 97.2
+   },
+   {
+    "model": "q2_k_xl",
+    "kld": 0.0535,
+    "top1": 93.5
+   },
+   {
+    "model": "iq2_xxs",
+    "kld": 0.0687,
+    "top1": 90.8
+   }
+  ],
+  "note": {
+   "en": "Logits of 2,048 positions at 2K against Unsloth's Q8_K_XL (llama.cpp): mean KLD and the share with the same top token. The smaller models were measured with 0.3.1-0.3.2.",
+   "ja": "2K の 2,048 位置のロジットを Unsloth の Q8_K_XL（llama.cpp）と比べた KLD 平均と、上位 1 位が同じ割合。小さいモデルは 0.3.1〜0.3.2 で測った値。"
+  }
+ },
+ "breakdown": {
+  "parts": [
+   "head",
+   "route",
+   "experts",
+   "cpu_wait",
+   "outside"
+  ],
+  "names": {
+   "en": {
+    "head": "attention and the rest of a layer",
+    "route": "routing via the host",
+    "experts": "picks + experts in VRAM",
+    "cpu_wait": "waiting for the CPU's experts",
+    "outside": "output, sampling, host"
+   },
+   "ja": {
+    "head": "アテンションと層のほかの部分",
+    "route": "ホスト経由の振り分け",
+    "experts": "振り分けと VRAM のエキスパート",
+    "cpu_wait": "CPU のエキスパートを待つ",
+    "outside": "出力、サンプリング、ホスト"
+   }
+  },
+  "rows": [
+   {
+    "version": "0.3.2",
+    "head": 8.92,
+    "route": 3.5,
+    "experts": 3.49,
+    "cpu_wait": 3.67,
+    "outside": 1.67
+   },
+   {
+    "version": "0.3.4",
+    "head": 9.36,
+    "route": 0.0,
+    "experts": 3.47,
+    "cpu_wait": 2.75,
+    "outside": 1.42
+   }
+  ],
+  "note": {
+   "en": "One token at 100K, code, no lookup; medians of a token's visits stamped on the card (INKLING2_VISIT_TRACE, which adds about 1 ms). A bar is the sum of the parts' medians; a whole token took 21.2 ms (0.3.2) and 17.3 ms (0.3.4) on the host. In 0.3.4 a token's 48 visits are one CUDA graph, routed on the card.",
+   "ja": "100K、コード、lookup なしの 1 トークン。カードで刻んだ訪問ごとの時間の中央値（INKLING2_VISIT_TRACE、刻みの分 約 1 ms 遅い）。棒は部分ごとの中央値の和。1 トークン全体はホストで測って 21.2 ms（0.3.2）、17.3 ms（0.3.4）。0.3.4 では 48 訪問を 1 本の CUDA Graph にし、カードで振り分ける。"
+  }
+ }
 }

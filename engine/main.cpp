@@ -5,6 +5,7 @@
 //
 // The protocol is the one `strata --serve` speaks (src/program/generate.cpp): GEN, GENI for a prompt with pictures,
 // STOP and QUIT in, and RESUME, PP, T, DONE and ERR out.
+#include "cpu_experts.hpp"
 #include "conversations.hpp"
 #include "engine.hpp"
 #include "guesses.hpp"
@@ -116,6 +117,32 @@ public:
         // inkling2 fork: no top-k, top-p or min-p (the model card's sampling): the whole vocabulary's softmax, drawn
         // from by its running sum.  The same distribution as the sorted candidates below, without the sort of every
         // token (15 to 20 ms a token for 201,024 on the 265K).
+        // inkling2 fork, on by default since 0.3.4 (INKLING2_FAST_PICK=0 off): the same distribution in AVX2 floats
+        // (softmax_blocks()), the draw found by blocks of 256: 0.77 -> 0.12 ms a token on the 265K.
+        // The rounding is another, so a draw at a boundary between two tokens may go the other way.
+        static const bool fast_pick = !std::getenv("INKLING2_FAST_PICK") || std::atoi(std::getenv("INKLING2_FAST_PICK")) != 0;
+        if (fast_pick && (s.top_k <= 0 || s.top_k >= n_vocab) && s.top_p >= 1.f && s.min_p <= 0.f) {
+            constexpr int kB = 256;
+            const int nb = (n_vocab + kB - 1) / kB;
+            pf_.resize((size_t) n_vocab);
+            blk_.resize((size_t) nb);
+            float* p = pf_.data();
+            const double sum = strata::poly::softmax_blocks(logits, n_vocab, 1.f / s.temperature, p, blk_.data());
+            double u = std::uniform_real_distribution<double>(0.0, sum)(rng);
+            for (int b = 0; b < nb; ++b) {
+                if (u >= blk_[(size_t) b] && b + 1 < nb) {
+                    u -= blk_[(size_t) b];
+                    continue;
+                }
+                const int a = b * kB, z = std::min(n_vocab, a + kB);
+                double cum = 0.0;
+                for (int i = a; i < z; ++i)
+                    if ((cum += p[i]) > u && p[i] > 0.f) return i;
+                for (int i = z - 1; i >= a; --i)   // u at the block's top (rounding)
+                    if (p[i] > 0.f) return i;
+            }
+            return strata::poly::most_likely(logits, n_vocab);
+        }
         if ((s.top_k <= 0 || s.top_k >= n_vocab) && s.top_p >= 1.f && s.min_p <= 0.f) {
             float mx = logits[0];
             for (int i = 1; i < n_vocab; ++i) mx = std::max(mx, logits[i]);
@@ -208,6 +235,8 @@ private:
     std::vector<Cand> cand_;
     std::vector<float> pen_;
     std::vector<double> p_;
+    std::vector<float> pf_;     ///< inkling2 fork, INKLING2_FAST_PICK: the probabilities
+    std::vector<double> blk_;   ///< and their sums by blocks of 256
     std::unordered_map<int32_t, int> seen_;
 };
 
@@ -405,6 +434,10 @@ struct Session {
         int64_t guessed = 0, guessed_right = 0;
         double prompt_ms = 0, decode_ms = 0;
         const char* finish = "length";
+        // inkling2 fork, INKLING2_REPORT_CACHE: the steps of a token alone and of a window, their time (to the
+        // next token picked) and the tokens the windows wrote
+        int64_t alone = 0, windows = 0, window_wrote = 0;
+        double alone_ms = 0, window_ms = 0, alone_pick_ms = 0;
     };
 
     // Reads the prompt and generates.  on_token gets every token, the end-of-sequence one included.  The rows of
@@ -562,14 +595,19 @@ struct Session {
                     use = policy.choose(1 + n_d, k, match);
                 }
                 if (use.t == 1) {
+                    const Clock::time_point step_at = Clock::now();
                     engine.eval(&t, 1, true);
                     kept.read(&t, 1);
+                    const Clock::time_point pick_at = Clock::now();
                     t = pick(engine.logits());
+                    r.alone_pick_ms += ms_since(pick_at);
+                    ++r.alone, r.alone_ms += ms_since(step_at);
                     policy.observe(false, 1, 0, 0, count(1, 1));
                     continue;
                 }
                 w[0] = t;
                 if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
+                const Clock::time_point step_at = Clock::now();
                 engine.window(w, use.t);
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
@@ -579,6 +617,7 @@ struct Session {
                 while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
                 engine.keep(right + 1);
                 kept.read(w, right + 1);
+                ++r.windows, r.window_wrote += right + 1, r.window_ms += ms_since(step_at);
                 r.guessed += use.t - 1;
                 r.guessed_right += right + (more ? 0 : 1);
                 policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
@@ -1271,6 +1310,25 @@ int serve(Session& ss) {
                              : 0.0,
                          (double) (now.tail_experts - before.tail_experts) * per,
                          hits + misses > 0 ? 100.0 * (double) hits / (double) (hits + misses) : 100.0);
+            if (r.alone + r.windows > 0)
+                std::fprintf(stderr, "strata-inkling2: answer steps: %lld alone in %.0f ms (%.2f ms each, %.3f ms of it the pick), %lld windows in "
+                                     "%.0f ms (%.2f ms each, %lld tokens written)\n", (long long) r.alone, r.alone_ms,
+                             r.alone_ms / (double) std::max<int64_t>(1, r.alone),
+                             r.alone_pick_ms / (double) std::max<int64_t>(1, r.alone), (long long) r.windows, r.window_ms,
+                             r.window_ms / (double) std::max<int64_t>(1, r.windows), (long long) r.window_wrote);
+            if (now.steps_alone + now.steps_many > before.steps_alone + before.steps_many)
+                std::fprintf(stderr, "strata-inkling2: steps: %lld alone (%lld as one recording, %lld bells), %lld windows "
+                                     "of %lld tokens\n", (long long) (now.steps_alone - before.steps_alone),
+                             (long long) (now.gt_steps - before.gt_steps), (long long) (now.gt_rings - before.gt_rings),
+                             (long long) (now.steps_many - before.steps_many),
+                             (long long) (now.steps_many_tokens - before.steps_many_tokens));
+            if (now.gt_steps > before.gt_steps) {
+                const double k = 1.0 / (double) (now.gt_steps - before.gt_steps);
+                std::fprintf(stderr, "strata-inkling2: a recorded step on the host: %.3f ms before its launch, %.3f to its end, "
+                                     "%.3f after it, %.3f for the output\n", (now.gt_pre_ms - before.gt_pre_ms) * k,
+                             (now.gt_graph_ms - before.gt_graph_ms) * k, (now.gt_post_ms - before.gt_post_ms) * k,
+                             (now.gt_out_ms - before.gt_out_ms) * k);
+            }
             // INKLING2_TIMELINE=1: the written tokens' visits, per token
             engine.tl_settle();
             const strata::poly::Stats& tl = engine.stats();
@@ -1559,6 +1617,8 @@ void usage() {
 #if defined(STRATA_GPU_METAL)
                  "                         Metal default: q8_0 for a compatible Qwen35MoE geometry, else fp16\n"
 #endif
+                 "  --vram-experts N       at most N routed experts in VRAM (default 0: as many as the VRAM free at\n"
+                 "                         the start allows, less --vram-reserve-mib)\n"
                  "  --expert-swaps N       while an answer is written, up to N experts it keeps using are on their way\n"
                  "                         into VRAM, in place of cached ones it uses less (default 64, 0 = the cache\n"
                  "                         stays as it was loaded)\n"
@@ -1711,6 +1771,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-draft") o.draft = false;
         else if (a == "--draft-model") o.draft_model = val();
         else if (a == "--expert-swaps") o.expert_swaps = std::atoi(val());
+        else if (a == "--vram-experts") o.vram_experts = std::atoi(val());
         else if (a == "--ram-experts-mib") o.ram_experts_mib = std::atoll(val());
         else if (a == "--read-mib") o.read_mib = std::atoi(val());
         else if (a == "--tail-skip") o.tail_skip = std::atoi(val());

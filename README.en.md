@@ -6,10 +6,11 @@
 > [PolyStrata](https://github.com/simplexai-labs/PolyStrata); it is not part of either project and is not supported
 > by their authors.
 
-> **Status (0.3.2)**
-> - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0049, top-1 agreement 97.4% at a 2K
->   context; mean KLD 0.0075, top-1 96.9% at a 128K context.
-> - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0026, top-1 98.4%.
+> **Status (0.3.4)**
+> - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0053, top-1 agreement 97.7% at a 2K
+>   context; mean KLD 0.0081, top-1 96.7% at a 128K context.
+> - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0030, top-1 98.0% (0.3.2: 0.0026 / 98.4%, which 0.3.4 gives
+>   again with its three changes set to 0).
 > - The smaller models (Q3_K_XL / Q2_K_XL / IQ2_XXS) were checked at 2K only.
 > - Pictures: a photo, a screenshot and a chart were described correctly (no benchmark).
 > - Tested on one PC only (RTX 5070 / Windows 11). The 8 GB and 6 GB figures were measured on that RTX 5070 with its
@@ -39,28 +40,30 @@ Measured on: RTX 5070 12 GB, Core Ultra 7 265K, DDR5-5600 32 GB, Windows 11, dri
 
 ## What to use, by VRAM
 
-Writing speed (temperature 1.0, tok/s). The 12 GB IQ4_XS row is 0.3.2, measured after one warm-up answer on the same prompt (the first answer after a start is about 10% slower, while the expert cache settles). The other rows are 0.3.1's (after an 8K prompt, or after reading the last 8K of a saved long context).
+Writing speed (temperature 1.0, tok/s). The 12 GB IQ4_XS row is 0.3.4 (256K: 0.3.2), new code written after a source-code context, measured after one warm-up answer in the same engine (the first answer after a start is about 10% slower, while the expert cache settles). The other rows are 0.3.1's (after an 8K prompt, or after reading the last 8K of a saved long context).
 
 | VRAM | Choice | 8K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| 12 GB | IQ4_XS (default), 128K | 70.7-71.5 | 54.7-55.5 | 44.3 | 36.6 (`--context 256k`) |
+| 12 GB | IQ4_XS (default), 128K | 84.7 | 68.6 | 51.2 | 36.6 (`--context 256k`, 0.3.2) |
 | 8 GB | IQ4_XS (quality) | 51.4 | 34.3 | 25.3 | does not fit |
 | 8 GB | Q3_K_XL (speed) | 57.6 | 38.8 | 26.1 | does not fit |
 | 6 GB | IQ4_XS or Q3_K_XL, up to 64K | 35.0 / 39.0 | 19.4 / 22.2 | does not fit | does not fit |
 
 - The figures vary by about ±2% between measuring sessions.
-- 12 GB: prose and code contexts at 8K and 64K, code at 128K and 256K. 256K was measured with the bench settings (2,048-token prompt batches, 400 MiB of VRAM left free).
+- 12 GB: code contexts (100K: 61.6). 256K was measured with the bench settings (2,048-token prompt batches, 400 MiB of VRAM left free).
 - **8 GB / 6 GB:** measured on this RTX 5070 with its VRAM limited by `--vram-reserve-mib` (not on real cards), with
   2,048-token prompt batches. setup picks 1,024 / 512 for those cards, which leaves more VRAM for experts, so writing
   should be faster than this (not measured).
 - **Context:** setup picks 32K on 8 GB and 16K on 6 GB; for the lengths above use e.g. `setup.bat --context 128k`.
 - **Long contexts narrow the gaps:** the KV cache takes the experts' VRAM and most of them run on the CPU.
 
-![Writing speed](docs/charts/writing.png)
+![Writing speed](docs/charts/decode_en.png)
 
-![Reading speed](docs/charts/reading.png)
+![Reading speed](docs/charts/reading_en.png)
 
-The charts are drawn from `docs/charts/measurements.json` by `python docs/charts/make_charts.py`.
+![Where a token's time goes at 100K](docs/charts/breakdown_en.png)
+
+The charts are drawn from `docs/charts/measurements.json` by `python docs/charts/make_charts.py`. The "0.3.2" bars are this engine with 0.3.4's three changes set to 0 and `--window 8` (0.3.2's decode), measured the same day.
 
 ### Quality and speed of each model
 
@@ -68,17 +71,18 @@ Quality: 2K context against Unsloth's Q8_K_XL logits (llama.cpp); a lower KLD is
 
 | Model (`--model`) | File | Mean KLD | Top-1 | 12 GB writing (8K / 128K) |
 |---|---|---|---|---|
-| `iq4_xs` (default) | 15.7 GB | 0.0026 | 98.4% | 70.7 / 44.3 (0.3.2) |
+| `iq4_xs` (default) | 15.7 GB | 0.0030 | 98.0% | 84.7 / 51.2 (0.3.4) |
 | `q3_k_xl` | 13.6 GB | 0.0090 | 97.2% | 69.0 / 45.1 |
 | `q2_k_xl` | 9.1 GB | 0.0535 | 93.5% | 74.0 / 45.4 |
 | `iq2_xxs` | 8.5 GB | 0.0687 | 90.8% | 79.9 / 51.6 |
 
-- Speeds vary by about ±2% between measuring sessions. All but IQ4_XS are 0.3.1's.
+- Speeds vary by about ±2% between measuring sessions. All but IQ4_XS are 0.3.1's (their quality 0.3.1-0.3.2's; 0.3.4's
+  changes were checked with IQ4_XS).
 - Q2_K_XL and IQ2_XXS are fast, but their measured quality drop is large (KLD about 20-26x IQ4_XS's); setup says so
   when one is chosen.
 - The smaller models come from the same Unsloth repository and revision, SHA-256 checked.
 
-![Quality](docs/charts/quality.png)
+![Quality](docs/charts/quality_en.png)
 
 ### 256K (12 GB)
 
@@ -96,17 +100,17 @@ tok/s (IQ2_XXS).
 
 ## Speed on that PC (IQ4_XS, 12 GB)
 
-One request; 200 tokens after the first 16. This engine's temperature-1.0 writing and its prompt reads are 0.3.2, after one warm-up answer on the same prompt; the greedy rows and NInfer are 0.3.1's. 128K writing: after a 128K code context.
+One request; 200 tokens after the first 16. This engine's temperature-1.0 writing and its 128K read are 0.3.4, after one warm-up answer on the same prompt; the greedy rows, the 8K read and NInfer are 0.3.1's. 128K writing: after a 128K code context.
 
 | | This engine | NInfer 2026-11-22.2 (Windows) |
 |---|---|---|
-| 8K, temperature 1.0 | 70.7 tok/s | 49.7 tok/s |
+| 8K, temperature 1.0 | 84.7 tok/s | 49.7 tok/s |
 | 8K, greedy | 68.9 tok/s | 51.5 tok/s |
 | 8K, greedy + lookup drafting | 69.7 tok/s | |
 | 8K prompt | 2,247 tok/s (0.3.1; 0.3.2: 2,565 at 4K, 2,475 at 32K) | 2,171 tok/s |
-| 128K, temperature 1.0 | 44.3 tok/s | 26.2 tok/s |
+| 128K, temperature 1.0 | 51.2 tok/s | 26.2 tok/s |
 | 128K, greedy | 42.9 tok/s | 26.3 tok/s |
-| 128K prompt (whole context) | 1,997 tok/s | 663 tok/s |
+| 128K prompt (whole context) | 1,978 tok/s | 663 tok/s |
 | CPU while writing | 7-8 cores | ~10 cores |
 
 - This engine's figures vary by about ±2% between measuring sessions.
@@ -114,9 +118,9 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
   at 20 (this engine samples from the whole vocabulary). Its docs report 83.5 tok/s on an RTX 5070 under Linux;
   on Windows it disables CUDA graphs for this model. [docs/ninfer_comparison.md](docs/ninfer_comparison.md)
 - Against llama.cpp's logits (IQ4_XS, fp16 KV; this engine's KV is q8_0):
-  - 2K (2,048 tokens): mean KLD 0.0049, top-1 97.4%
-  - 128K (the last 1,023 positions of a 124,928-token context): mean KLD 0.0075, top-1 96.9%
-  - Against Q8_K_XL at 2K: mean KLD 0.0026, top-1 98.4%
+  - 2K (2,048 tokens): mean KLD 0.0053, top-1 97.7% (0.3.2: 0.0049 / 97.4%)
+  - 128K (the last 1,023 positions of a 124,928-token context): mean KLD 0.0081, top-1 96.7% (0.3.2: 0.0075 / 96.9%)
+  - Against Q8_K_XL at 2K: mean KLD 0.0030, top-1 98.0% (0.3.2: 0.0026 / 98.4%)
 - A conversation's next turn reuses the start it shares with the last one: turn 2 of a 32K conversation read in
   0.23 s (15.6 s read again from the start).
   - After an agent compacts the conversation, the system prompt and the tool definitions are not read again either
@@ -130,6 +134,19 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
   - Window 32 places slightly different experts in VRAM than window 8, so the output may not match it exactly (the
     same kind of variation that happens between starts at the default).
 - More: [docs/measurements.md](docs/measurements.md)
+
+### What changed in 0.3.4 (on by default; an environment variable turns each off)
+
+| Change | Effect (100K, code) | Off with |
+|---|---|---|
+| A token on the card alone: its 48 visits are one CUDA graph, the experts routed on the card; only when a pick is outside VRAM does a kernel tell the CPU through mapped host memory, and wait in a kernel for its sum | a token without lookup: 21.3 -> 18.3 ms | `INKLING2_GPU_TOKEN=0` |
+| Where experts go: layers 20-23, of other types (Q5_K / Q4_K / IQ4_XS), get their slots first, so they keep them when a growing context cuts the cache (at 100K their picks were 93-98% on the CPU) | +6% without lookup | `INKLING2_SLOT_ORDER=0` |
+| Sampling: the whole vocabulary's probabilities in AVX2 | 0.78 -> 0.12 ms a token | `INKLING2_FAST_PICK=0` |
+
+- Together, writing at 100K with lookup went from about 50 to 60 tok/s on prose (+21%) and from about 55 to 62.5 on code
+  (+14%), two runs each, alternating.
+- None changes the model; the order of the sums and where the experts sit change, so the output is not bit for bit
+  0.3.2's. The quality is the Status above.
 
 ## For long contexts: a 4-bit V cache (a little lower quality)
 
@@ -145,6 +162,8 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
 
 - The 256K speeds were measured in 0.3.1's time (the first answer after a start); they compare runs of one session.
 - At 128K its quality drop is a little past this project's bar (1.5x the default's KLD). It is a choice for speed at 256K.
+- **With 0.3.4:** faster at long contexts (100K without lookup: 59.9 -> 63.3 tok/s, +5.7%), but at 128K the quality falls to
+  mean KLD 0.0112 (1.5x the default's) and top-1 95.5% (1.4 points below the default). The default stays q8_0.
 
 ## Faster, approximate: expert skipping
 
@@ -224,8 +243,8 @@ Settings setup chooses by usable VRAM: 128K context / 2,048-token prompt batches
 - 7-8 CPU cores busy while writing (the expert threads spin between layers; idle between requests).
 - ~12 GB of RAM for the engine with the default 9 GB expert budget, plus the OS file cache.
 - Tested on Windows, on one PC.
-- A little further from the reference at 128K: against llama.cpp, mean KLD rises from 0.0049 at 2K to 0.0075 (top-1 97.4% to
-  96.9%). The reference uses fp16 KV; this engine uses q8_0.
+- A little further from the reference at 128K: against llama.cpp, mean KLD rises from 0.0053 at 2K to 0.0081 (top-1 97.7% to
+  96.7%). The reference uses fp16 KV; this engine uses q8_0.
 - With tools and thinking off, the model may still think briefly before its call.
 - Pictures are on by default (`setup.bat --vision off` turns them off). The image encoder runs on the CPU and takes
   no VRAM: about 0.5 GB of RAM, started by the first picture and stopped after two idle minutes. A 640 x 400 picture

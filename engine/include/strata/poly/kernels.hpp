@@ -262,6 +262,23 @@ void sq_rows_w4a4(const SqTcTables& t, int n_tiles, const float* x, int m, void*
 // waited 10 s
 void wait_host_flag(const unsigned* flag, unsigned want, unsigned* err, void* stream);
 bool wait_host_value(const unsigned* flag, unsigned want, void* stream);
+/// inkling2 fork, INKLING2_GPU_TOKEN: a token's visits in one recording, the CPU's part of a visit asked for through
+/// pinned memory.  ring and ack on lines of their own; visit: the visit that rang; err: a wait gave up.
+struct alignas(64) TokenBell {
+    volatile unsigned ring;
+    unsigned pad0[15];
+    volatile unsigned ack;
+    unsigned pad1[15];
+    volatile int visit;
+    volatile unsigned err;
+    unsigned pad2[14];
+};
+/// The picks of one token at `visit` into all_ids[visit * n_used ...] (pinned); when one of them has no slot in
+/// table, ++*seq rings the bell with it and *cur holds it, else *cur is 0.
+void bell_ring(int visit, const int32_t* ids, const void* const* table, int n_used, TokenBell* bell, unsigned* seq,
+               unsigned* cur, int32_t* all_ids, void* stream);
+/// When *cur is not 0: waits for the host's ack of it, then acc[i] += x[i] (x pinned, n floats), as axpy() adds.
+void bell_wait_add(const unsigned* cur, TokenBell* bell, const float* x, float* acc, int n, void* stream);
 // inkling2 fork: moe_sum() of the picks whose table[ids] is set, the others left out
 void card_part_sum(const float* x, const float* w, const int32_t* ids, const void* const* table, float* acc, int n,
                    int n_used, int rows, void* stream);

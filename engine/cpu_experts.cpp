@@ -16,6 +16,55 @@
 #include <numeric>
 
 namespace strata::poly {
+
+// inkling2 fork, INKLING2_FAST_PICK: exp of 8 floats (Cephes' expf: 2^n * a degree-5 polynomial, 2 ulp or so)
+static inline __m256 exp8(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.3f));
+    const __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
+                                      _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    r = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), r);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(r, r), _mm256_add_ps(r, _mm256_set1_ps(1.f)));
+    const __m256i n = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(n));
+}
+
+double softmax_blocks(const float* logits, int n, float inv_t, float* p, double* blk) {
+    __m256 m8 = _mm256_set1_ps(-INFINITY);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) m8 = _mm256_max_ps(m8, _mm256_loadu_ps(logits + i));
+    float mt[8];
+    _mm256_storeu_ps(mt, m8);
+    float mx = mt[0];
+    for (int j = 1; j < 8; ++j) mx = std::max(mx, mt[j]);
+    for (; i < n; ++i) mx = std::max(mx, logits[i]);
+    const __m256 vm = _mm256_set1_ps(mx), vt = _mm256_set1_ps(inv_t);
+    double total = 0.0;
+    for (int a = 0; a < n; a += 256) {
+        const int z = std::min(n, a + 256);
+        __m256 acc = _mm256_setzero_ps();
+        int k = a;
+        for (; k + 8 <= z; k += 8) {
+            const __m256 e = exp8(_mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(logits + k), vm), vt));
+            _mm256_storeu_ps(p + k, e);
+            acc = _mm256_add_ps(acc, e);
+        }
+        float at[8];
+        _mm256_storeu_ps(at, acc);
+        double b = 0.0;
+        for (int j = 0; j < 8; ++j) b += at[j];
+        for (; k < z; ++k) b += p[k] = std::exp((logits[k] - mx) * inv_t);
+        blk[a / 256] = b;
+        total += b;
+    }
+    return total;
+}
 namespace {
 
 // Rows of gate and up, and of down, a task.  With fewer tasks than several a thread, the last round left threads

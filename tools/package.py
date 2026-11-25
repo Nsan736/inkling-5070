@@ -3,7 +3,7 @@
 The package holds bin\\ (strata-inkling2.exe, inkling2_logits_dump.exe, strata-vision.exe, the CUDA and C++ runtime DLLs they need),
 the server, the scripts, the docs and the licenses.  The model is not in it: setup.bat downloads it.
 
-  python tools/package.py [--version 0.3.3] [--build build]
+  python tools/package.py [--version 0.3.4] [--build build]
 
 Redistributed runtime files:
   cublas64_13.dll, cublasLt64_13.dll   NVIDIA CUDA Toolkit, redistributable under the CUDA EULA's Attachment A
@@ -51,7 +51,7 @@ def crt_dir():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", default="0.3.3")
+    ap.add_argument("--version", default="0.3.4")
     ap.add_argument("--build", default=str(ROOT / "build"))
     a = ap.parse_args()
     bin_src = Path(a.build) / "bin"

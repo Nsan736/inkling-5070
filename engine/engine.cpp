@@ -2328,6 +2328,18 @@ void Engine::fill_expert_cache() {
 #endif
                        full_bytes_ > 0 ? full_bytes_ : all;
     size_t arena = std::min({all, free_b - reserve, arena_.base ? arena_.reserved - 256 : most});
+    // inkling2 fork, --vram-experts N (Options::vram_experts): at most N experts in VRAM, the cache no larger than
+    // they need (100K on an RTX 5070: 14 experts more than the default's and the same speed; setup leaves it 0)
+    if (opt_.vram_experts > 0) {
+        size_t need = 0, room = arena;
+        int n = 0;
+        for (const Cand& c : cands) {
+            if (n >= opt_.vram_experts) break;
+            if (c.bytes > room) continue;
+            room -= c.bytes, need += c.bytes, ++n;
+        }
+        arena = std::min(arena, need);
+    }
 #if defined(STRATA_GPU_METAL)
     size_t metal_cap = 0, metal_stage_need = 0;
     if (opt_.metal_balanced) {
@@ -2374,12 +2386,33 @@ void Engine::fill_expert_cache() {
     std::vector<Cand> taken;
     size_t room = arena;
     for (const Cand& c : cands) {
+        if (opt_.vram_experts > 0 && (int) taken.size() >= opt_.vram_experts) break;   // inkling2 fork
         if (c.bytes > room) continue;   // a smaller expert of another layer may still fit
         room -= c.bytes;
         taken.push_back(c);
     }
-    std::sort(taken.begin(), taken.end(),
-              [](const Cand& a, const Cand& b) { return a.il != b.il ? a.il < b.il : a.e < b.e; });
+    // inkling2 fork, on by default since 0.3.4 (INKLING2_SLOT_ORDER=0 lays the layers in order, as before): the
+    // layers whose slot size few layers share go first.  A
+    // cut (shrink_cache()) takes the cache's end, and an expert past it moves only to a slot of its own size before
+    // it: Inkling 2's layers 20 to 23 (Q5_K / Q4_K / IQ4_XS, the others NVFP4) lay last and lost all their slots as
+    // a 100K context grew (93-98% of their picks on the CPU), while the NVFP4 ones past the cut find slots.
+    static const bool rare_first = [] {
+        const char* v = std::getenv("INKLING2_SLOT_ORDER");
+        return !v || std::string(v) != "0";
+    }();
+    std::vector<int> rank(layers_.size(), 0);
+    if (rare_first) {
+        std::vector<int> of_size((size_t) std::max(n_trade_, 1), 0);
+        for (const Layer& L : layers_)
+            if (L.trade >= 0) ++of_size[(size_t) L.trade];
+        const int most = *std::max_element(of_size.begin(), of_size.end());
+        for (size_t il = 0; il < layers_.size(); ++il)
+            rank[il] = layers_[il].trade >= 0 && of_size[(size_t) layers_[il].trade] < most ? 0 : 1;
+    }
+    std::sort(taken.begin(), taken.end(), [&](const Cand& a, const Cand& b) {
+        if (rank[(size_t) a.il] != rank[(size_t) b.il]) return rank[(size_t) a.il] < rank[(size_t) b.il];
+        return a.il != b.il ? a.il < b.il : a.e < b.e;
+    });
     for (const Cand& c : taken) {
         Layer& L = layers_[(size_t) c.il];
         uint8_t* s = exp_ + exp_at_;
@@ -2751,6 +2784,8 @@ int Engine::grow_cache(size_t bytes, bool later) {
     std::vector<Cand> taken;
     size_t room = arena_.mapped - kTail - exp_at_;
     for (const Cand& c : cands) {
+        // inkling2 fork, --vram-experts: the cache grows back to N at most
+        if (opt_.vram_experts > 0 && cached_ + (int) taken.size() >= opt_.vram_experts) break;
         const size_t n = layers_[(size_t) c.il].slot_bytes;
         if (n > room) continue;
         room -= n;
@@ -2935,6 +2970,25 @@ void Engine::follow_loop() {
 //
 // A prompt batch neither counts nor moves anything.  What a prompt routes to says no more about the answer than
 // the profile does, and moving the cache while the prompt was read cost 3% of the reading speed (measured).
+// inkling2 fork, INKLING2_LOOP_WEIGHT=W (opt-in): what a use adds to recent_ for a layer whose experts more than one
+// visit runs (Inkling 2's loop): W, else 1.  A loop visit's CPU experts run beside its experts in VRAM, so an expert
+// of the loop the CPU computes costs a token less than one of a layer run once.
+float Engine::swap_weight(int il) {
+    if (swap_w_.empty()) {
+        static const float w = [] {
+            const char* v = std::getenv("INKLING2_LOOP_WEIGHT");
+            return v && std::atof(v) > 0 ? (float) std::atof(v) : 1.f;
+        }();
+        std::vector<int> visits(layers_.size(), 0);
+        for (int v = 0; v < (int) layers_.size(); ++v)
+            if (routed(layers_[(size_t) v])) ++visits[(size_t) home_of(v)];
+        swap_w_.assign(layers_.size(), 1.f);
+        for (size_t i = 0; i < layers_.size(); ++i)
+            if (visits[i] > 1) swap_w_[i] = w;
+    }
+    return swap_w_[(size_t) il];
+}
+
 void Engine::follow(int written) {
     {
         std::lock_guard<std::mutex> l(swap_m_);
@@ -2985,7 +3039,12 @@ void Engine::follow(int written) {
         n_free += s.at.load() == Swap::kFree;
     }
     if (written <= 0) return;
-    const float keep = std::exp2(-(float) written / (float) kSwapHalf);
+    // inkling2 fork, INKLING2_SWAP_HALF=N (opt-in): the counts' half-life in written tokens (kSwapHalf)
+    static const float half = [] {
+        const char* v = std::getenv("INKLING2_SWAP_HALF");
+        return v && std::atof(v) > 0 ? (float) std::atof(v) : (float) kSwapHalf;
+    }();
+    const float keep = std::exp2(-(float) written / half);
     for (float& r : recent_) r *= keep;
     const auto from_pool = [&](Swap& s) {   // the slot follow_loop() copies s from, held until s arrives
         s.from = -1;
@@ -3064,7 +3123,13 @@ void Engine::follow(int written) {
             const size_t k = (size_t) c * most + trade_at_[(size_t) c];
             const Pick& in = in_[k];
             const Pick& out = out_[k];
-            if (in.il < 0 || out.il < 0 || in.recent < 2.f * out.recent + kSwapMin) continue;
+            // inkling2 fork, INKLING2_SWAP_GAIN=X (opt-in): how many times the outgoing one's count the incoming
+            // one needs (2)
+            static const float gain_x = [] {
+                const char* v = std::getenv("INKLING2_SWAP_GAIN");
+                return v && std::atof(v) > 0 ? (float) std::atof(v) : 2.f;
+            }();
+            if (in.il < 0 || out.il < 0 || in.recent < gain_x * out.recent + kSwapMin) continue;
             if (best < 0 || in.recent - out.recent > gain) {
                 best = c;
                 gain = in.recent - out.recent;
@@ -4823,7 +4888,8 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
     }
     Clock::time_point t0 = Clock::now();
     if (split) {
-        ck(cudaEventSynchronize((cudaEvent_t) (split_launched_ ? split_wait_ev_ : ev_card_)), "card split");
+        if (!bell_mode_)
+            ck(cudaEventSynchronize((cudaEvent_t) (split_launched_ ? split_wait_ev_ : ev_card_)), "card split");
     } else if (flag_wait_ > 0 && n == 1 && !block_pass_ && seq_host_) {
         // INKLING2_FLAG_WAIT: the router's counter; the event now and then, which is done if the counter missed
         const unsigned want = ++seq_want_;
@@ -4901,7 +4967,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                     const size_t e = (size_t) ids[k];
                     if (!block_pass_) {
                         ++use_[(size_t) il * n_expert_ + e];
-                        if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
+                        if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += swap_weight(il);
                     }
                     const sq::Expert& x = L.sq_ex[e];
                     if (const uint8_t* s = L.slot[e]) {
@@ -5042,7 +5108,7 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                 // a block's guesses are not the answer's tokens: the cache is not filled by them
                 if (!block_pass_) {
                     ++use_[(size_t) il * n_expert_ + e];
-                    if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
+                    if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += swap_weight(il);
                 }
                 // NVFP4's down scale goes on the weight (ExpertScales)
                 const float we = L.h_s_down.empty() ? w[k] : w[k] * L.h_s_down[e];
@@ -5317,7 +5383,7 @@ void Engine::sync_slots() {
 
 // inkling2 fork, INKLING2_CARD_SPLIT=1: whether moe() of n tokens at layer L routes them on the card (moe_split_launch())
 bool Engine::split_ok(const Layer& L, int n) const {
-    return card_split_ > 0 && split_slots_ && d_slots_ && !block_pass_ && !L.sq() && n <= kCpuRows && n * n_used_ <= card_rows() &&
+    return (card_split_ > 0 || gpu_token_now_) && split_slots_ && d_slots_ && !block_pass_ && !L.sq() && n <= kCpuRows && n * n_used_ <= card_rows() &&
            opt_.cache_bias <= 0.f && opt_.skip_weight <= 0.f && opt_.tail_skip <= 0 && !opt_.dump &&
            L.card != 0 && kernels::native_mmvq_ids_supported((int) L.gu_type) &&
            kernels::native_mmvq_ids_supported((int) L.u_type) && kernels::native_mmvq_ids_supported((int) L.d_type);
@@ -5336,8 +5402,11 @@ void Engine::moe_split_launch(Layer& L, int il, int n, void* ev) {
     route_card(il, n, d_ids_, d_wts_);
     const int rr = n * n_used_;
     copy2(d_ids_, h_ids_, rr, d_wts_, h_card_w_, rr, st_);   // a kernel into pinned memory: no copy engine
-    ck(cudaEventRecord((cudaEvent_t) (ev ? ev : ev_card_), cs(st_)), "card split");
+    if (!bell_capture_) ck(cudaEventRecord((cudaEvent_t) (ev ? ev : ev_card_), cs(st_)), "card split");
     const void* const* table = d_slots_ + (size_t) il * n_expert_;
+    // INKLING2_GPU_TOKEN: the bell right after the picks, so the host's experts run beside the card's
+    if (bell_capture_)
+        bell_ring(bell_k_, d_ids_, table, n_used_, (TokenBell*) bell_, bell_seq_, bell_cur_, h_all_ids_, st_);
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_), ff = (size_t) n_ff_exp_;
     const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff, lane_slots_};
     kernels::native_mmvq_ids((int) L.gu_type, gate_up, rr, n_embd_, L.mixed() ? n_ff_exp_ : 2 * n_ff_exp_, st_);
@@ -5961,6 +6030,11 @@ void* Engine::record(F&& work) {
     }
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
+    if (bell_capture_) {   // inkling2 fork, INKLING2_GPU_TOKEN: the recording's size, once a recording
+        size_t nodes = 0;
+        if (cudaGraphGetNodes(g, nullptr, &nodes) == cudaSuccess)
+            std::fprintf(stderr, "strata-poly: INKLING2_GPU_TOKEN: the token's recording has %zu nodes\n", nodes);
+    }
     cudaGraphExec_t exec = nullptr;
     const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     cudaGraphDestroy(g);
@@ -5971,11 +6045,16 @@ void* Engine::record(F&& work) {
 
 // n tokens from pos() through every layer.  The sequence is not longer for it: the caller says by how much.
 void Engine::run(const int32_t* tokens, int n) {
+    const Clock::time_point run_at = Clock::now();   // inkling2 fork: Stats::gt_pre_ms
     if (n < 1 || n > rows_) throw std::logic_error("eval takes 1 to max_rows() tokens");
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
     cover(pos_ + n);
-    const Until parts{card_parts_};   // from a moe_card() to the layer_tail() after it
+    const Until parts{card_parts_};
+    if (!reading_ && n <= opt_.window) {   // inkling2 fork: the steps, for INKLING2_REPORT_CACHE
+        if (n == 1) ++stats_.steps_alone;
+        else ++stats_.steps_many, stats_.steps_many_tokens += n;
+    }   // from a moe_card() to the layer_tail() after it
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
@@ -5992,7 +6071,11 @@ void Engine::run(const int32_t* tokens, int n) {
         follow(n < kStageRows ? n : 0);
     }
     split_slots_ = false;   // inkling2 fork, INKLING2_CARD_SPLIT: the cache's slots as this call finds them
-    if (card_split_ > 0 && d_slots_ && n < kStageRows && !all_cached()) {
+    static const bool gpu_token_env = [] {   // inkling2 fork, on by default since 0.3.4; INKLING2_GPU_TOKEN=0 off
+        const char* v = std::getenv("INKLING2_GPU_TOKEN");
+        return !v || std::atoi(v) != 0;
+    }();
+    if ((card_split_ > 0 || (gpu_token_env && n == 1)) && d_slots_ && n < kStageRows && !all_cached()) {
         sync_slots();
         split_slots_ = true;
     }
@@ -6180,6 +6263,136 @@ void Engine::run(const int32_t* tokens, int n) {
         ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
         for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += routed(layers_[(size_t) il]) ? n * n_used_ : 0;
         return;
+    }
+    // inkling2 fork, INKLING2_GPU_TOKEN (on by default since 0.3.4, =0 off): a token alone, its visits in one recording.  Each routed visit:
+    // the head, the card's picks (moe_split_launch(), no event), the experts in VRAM, bell_ring(), then a kernel that
+    // waits for the host's ack when the visit rang and adds h_cpu_ (bell_wait_add(), as moe_add()), then the tail.
+    // This thread spins on the bell: a visit that rang has its CPU experts computed by moe() from the picks the
+    // card wrote to pinned memory, and is acked.  The same kernels as INKLING2_CARD_SPLIT's, in the same order.
+    if (gpu_token_env && replay && n == 1 && split_slots_ && !block_pass_ && snap_bits_ == 0 && tl_on_ <= 0 &&
+        !pass_ && !next_ && !dspark_) {
+        gpu_token_now_ = true;
+        bool ok = true;
+        std::vector<int> visits;
+        for (int il = lo_; il < hi_ && ok; ++il) {
+            const Layer& L = layers_[(size_t) il];
+            if (!routed(L)) continue;
+            const Layer& M = layers_[(size_t) home_of(il)];
+            ok = !batched(M, 1) && split_ok(M, 1) && !M.sq();
+            visits.push_back(il);
+        }
+        if (ok) {
+            if (!bell_) {
+                bell_ = hmalloc(sizeof(TokenBell), "pinned memory");
+                std::memset(bell_, 0, sizeof(TokenBell));
+                bell_seq_ = (unsigned*) dmalloc(2 * sizeof(unsigned), "scratch");
+                ck(cudaMemset(bell_seq_, 0, 2 * sizeof(unsigned)), "bell");
+                bell_cur_ = bell_seq_ + 1;
+                h_all_ids_ = (int32_t*) hmalloc((size_t) n_layer_ * kMaxUsed * sizeof(int32_t), "pinned memory");
+                cudaEvent_t e;
+                ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate");
+                bell_end_ = e;
+                if (!ev_card_) {   // moe_split_launch()'s pinned weights
+                    ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate");
+                    ev_card_ = e;
+                    h_card_w_ = (float*) hmalloc((size_t) kCpuRows * kMaxUsed * sizeof(float), "pinned memory");
+                }
+            }
+            TokenBell* bell = (TokenBell*) bell_;
+            std::vector<int> key{1 << 20};
+            for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, 1));
+            void*& pass = passes_[key];
+            if (!pass) {
+                bell_capture_ = true;
+                try {
+                    pass = record([&] {
+                        for (int k = 0, il = lo_; il < hi_; ++il) {
+                            Layer& L = layers_[(size_t) il];
+                            // INKLING2_VISIT_TRACE: 100 + il the visit's start, 41 its head done, 42 its experts
+                            // in VRAM done, 43 the CPU's sum added, 44 its tail done (45 / 46: its attention)
+                            vt_gpu(100 + il);
+                            layer_head(L, il, 1);
+                            vt_gpu(41);
+                            if (!routed(L)) continue;
+                            const int home = home_of(il);
+                            Layer& M = layers_[(size_t) home];
+                            moe_shared(L, il, 1);
+                            bell_k_ = k;
+                            moe_split_launch(M, home, 1);   // rings the bell after the picks
+                            vt_gpu(42);
+                            bell_wait_add(bell_cur_, bell, h_cpu_, fo_, n_embd_, st_);
+                            vt_gpu(43);
+                            card_parts_ = false;
+                            layer_tail(L, il, 1);
+                            vt_gpu(44);
+                            ++k;
+                        }
+                    });
+                } catch (...) {
+                    bell_capture_ = false;
+                    gpu_token_now_ = false;
+                    throw;
+                }
+                bell_capture_ = false;
+                std::fprintf(stderr, "strata-poly: INKLING2_GPU_TOKEN: a token's %zu visits recorded as one (room key %d)\n",
+                             visits.size(), room_key(1));
+            }
+            stats_.gt_pre_ms += ms_since(run_at);
+            const Clock::time_point launch_at = Clock::now();
+            ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "token graph");
+            ++stats_.gt_steps;
+            ck(cudaEventRecord((cudaEvent_t) bell_end_, cs(st_)), "token graph");
+            (void) cudaStreamQuery(cs(st_));   // on to the card now: WDDM holds launches back otherwise
+            std::vector<char> rang(visits.size(), 0);
+            std::exception_ptr failed;
+            bell_mode_ = split_launched_ = true;
+            try {
+                for (unsigned spin = 0;; ++spin) {
+                    const unsigned r = bell->ring;
+                    if (r != bell_seen_) {
+                        bell_seen_ = r;
+                        const int k = bell->visit;
+                        if (k < 0 || k >= (int) visits.size()) throw std::runtime_error("token graph: a bell from no visit");
+                        rang[(size_t) k] = 1;
+                        ++stats_.gt_rings;
+                        moe(visits[(size_t) k], 1);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        bell->ack = r;
+                        continue;
+                    }
+                    if ((spin & 63u) == 63u && cudaEventQuery((cudaEvent_t) bell_end_) != cudaErrorNotReady) break;
+                    _mm_pause();
+                }
+            } catch (...) {
+                failed = std::current_exception();
+            }
+            bell_mode_ = split_launched_ = false;
+            gpu_token_now_ = false;
+            if (failed) {
+                bell->ack = bell->ring;   // the card may still wait for an ack: the last ring's lets it end
+                (void) cudaStreamSynchronize(cs(st_));
+                std::rethrow_exception(failed);
+            }
+            ck(cudaEventSynchronize((cudaEvent_t) bell_end_), "token graph");
+            stats_.gt_graph_ms += ms_since(launch_at);
+            const Clock::time_point end_at = Clock::now();
+            if (bell->err) throw std::runtime_error("the card's wait for the CPU experts gave up");
+            // the cache's counts for the visits that did not ring (moe() counted the others)
+            for (size_t k = 0; k < visits.size(); ++k) {
+                if (rang[k]) continue;
+                const int home = home_of(visits[k]);
+                for (int j = 0; j < n_used_; ++j) {
+                    const size_t e = (size_t) h_all_ids_[k * (size_t) n_used_ + (size_t) j];
+                    ++use_[(size_t) home * n_expert_ + e];
+                    if (n_swap_ > 0) recent_[(size_t) home * n_expert_ + e] += swap_weight(home);
+                }
+                stats_.gpu_experts += n_used_;
+            }
+            stats_.gt_post_ms += ms_since(end_at);
+            gt_ran_ = true;
+            return;
+        }
+        gpu_token_now_ = false;
     }
     if (pt_on_ < 0) {   // inkling2 fork, INKLING2_PREFILL_TIMES
         pt_on_ = std::getenv("INKLING2_PREFILL_TIMES") ? 1 : 0;
@@ -6728,7 +6941,14 @@ void Engine::hand_on(int64_t pos, int n, float* h) {
 void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
     OnCard here(device_, split_);
     dsp_base_ = pos_, dsp_host_ = false;   // INKLING2_DSPARK: the taps of these rows from row 0
+    gt_ran_ = false;
     run(tokens, n);
+    const Clock::time_point out_at = Clock::now();   // inkling2 fork: Stats::gt_out_ms
+    struct OutTime {
+        Engine* e;
+        Clock::time_point t;
+        ~OutTime() { if (e->gt_ran_) e->stats_.gt_out_ms += ms_since(t); }
+    } out_time{this, out_at};
     if (next_) {
         hand_on(pos_, n, pass_rows(n));
         next_->eval(tokens, n, want_logits);

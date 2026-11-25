@@ -93,6 +93,7 @@ struct Options {
     float cpu_share = -1;         ///< of the experts outside VRAM that such a call routes to, the share the CPU
                                   ///< computes while the others are copied: the ones the fewest tokens chose;
                                   ///< below 0: as the two took the time between them; 0: none
+    int vram_experts = 0;         ///< inkling2 fork, --vram-experts: at most this many experts in VRAM (0: as VRAM allows)
     int expert_swaps = 64;        ///< experts on their way into the cache at a time while an answer is written, each
                                   ///< to the slot of one the answer uses less; 0: the cache stays as it was loaded
     int read_mib = -1;            ///< inkling2 fork: the pinned host memory a read's rows take (kReadBytes), in MiB;
@@ -237,6 +238,12 @@ struct Stats {
     int64_t pt_visits = 0, pt_copied_bytes = 0;
     int64_t tl_visits = 0;
     int64_t flag_waits = 0, flag_fallbacks = 0;   ///< INKLING2_FLAG_WAIT: waits on the counter, and of them by the event
+    // inkling2 fork: a written answer's steps, a token alone or a window of several (run(), outside a read), and
+    // of the alone ones those INKLING2_GPU_TOKEN recorded as one, with the visits that rang its bell
+    int64_t steps_alone = 0, steps_many = 0, steps_many_tokens = 0, gt_steps = 0, gt_rings = 0;
+    // and the host's time of those steps: before the recording's launch, the launch to its end, after it in run(),
+    // and eval()'s output after run()
+    double gt_pre_ms = 0, gt_graph_ms = 0, gt_post_ms = 0, gt_out_ms = 0;
 };
 
 /// The most likely token of n logits: the first of the largest.
@@ -1195,6 +1202,23 @@ protected:
     void* sq_xq_ = nullptr;             ///< the Q8_1_G64 blocks of a call's expert inputs (kCpuRows rows)
     void* sq_hq_ = nullptr;             ///< and of a launch's activations (kSqJobs rows)
     void* split_wait_ev_ = nullptr;     ///< the one moe() waits for
+    // inkling2 fork, INKLING2_GPU_TOKEN (on by default since 0.3.4, =0 off): a token alone, every visit in one recording (run()): routed on
+    // the card, the experts in VRAM computed there, and a visit with picks outside VRAM rings bell_ (TokenBell,
+    // pinned); this thread computes them (moe()) and acks, and the card waits for that in a kernel.  A visit with
+    // all its picks in VRAM does not wait for the host at all.
+    bool gpu_token_now_ = false;        ///< split_ok() for the recording's layers
+    bool bell_capture_ = false;         ///< moe_split_launch() records no event
+    bool bell_mode_ = false;            ///< moe() finds the picks on the host already
+    void* bell_ = nullptr;              ///< TokenBell, pinned
+    unsigned* bell_seq_ = nullptr;      ///< the card's ring counter
+    unsigned* bell_cur_ = nullptr;      ///< the visit's ring, 0: none
+    int32_t* h_all_ids_ = nullptr;      ///< pinned: every visit's picks of the token, for the cache's counts
+    void* bell_end_ = nullptr;          ///< the recording's end
+    unsigned bell_seen_ = 0;
+    int bell_k_ = 0;                    ///< the visit being recorded
+    bool gt_ran_ = false;               ///< the last run() took the recording
+    std::vector<float> swap_w_;         ///< inkling2 fork, INKLING2_LOOP_WEIGHT: swap_weight()'s, a layer
+    float swap_weight(int il);
     int64_t flag_waits_ = 0, flag_fallbacks_ = 0;
     // inkling2 fork, INKLING2_DSPARK=mtp.safetensors (off by default): Inkling 2 Mini's DSpark block drafter (dspark.hpp)
     // as the engine's draft (draft_ on, no draft block): the taps are the stream at the start of visits 5, 23 and 41

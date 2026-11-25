@@ -1133,6 +1133,52 @@ __global__ void wait_host_flag_kernel(const volatile unsigned* flag, unsigned wa
     }
 }
 
+// inkling2 fork, INKLING2_GPU_TOKEN: bell_ring() / bell_wait_add()
+__global__ void bell_ring_kernel(int visit, const int32_t* __restrict__ ids, const void* const* __restrict__ table,
+                                 int n_used, TokenBell* bell, unsigned* seq, unsigned* cur, int32_t* all_ids) {
+    int miss = 0;
+    for (int k = 0; k < n_used; ++k) {
+        const int32_t e = ids[k];
+        all_ids[visit * n_used + k] = e;
+        if (!table[e]) ++miss;
+    }
+    if (miss == 0) {
+        *cur = 0u;
+        return;
+    }
+    const unsigned s = ++*seq == 0u ? ++*seq : *seq;   // 0 is "no ring"
+    bell->visit = visit;
+    __threadfence_system();
+    bell->ring = s;
+    __threadfence_system();
+    *cur = s;
+}
+
+__global__ void bell_wait_add_kernel(const unsigned* __restrict__ cur, TokenBell* bell, const float* x,
+                                     float* __restrict__ acc, int n) {
+    __shared__ unsigned go;
+    if (threadIdx.x == 0) {
+        const unsigned s = *cur;
+        go = s != 0u;
+        if (go) {
+            unsigned long long t0, t;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+            while (bell->ack != s) {
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                if (t - t0 > 10000000000ull) {
+                    bell->err = 1u;
+                    go = 0u;
+                    break;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (!go) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) acc[i] = acc[i] + __ldcv(x + i) * 1.0f;
+}
+
 __global__ void add_bias_kernel(const float* __restrict__ b, float* __restrict__ acc, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) acc[size_t(blockIdx.y) * n + i] += b[i];
@@ -3084,6 +3130,15 @@ void moe_sum(const float* x, const float* w, float* acc, int n, int n_used, int 
 void card_part_sum(const float* x, const float* w, const int32_t* ids, const void* const* table, float* acc, int n,
                    int n_used, int rows, void* stream) {
     card_part_sum_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(x, w, ids, table, acc, n, n_used);
+}
+
+void bell_ring(int visit, const int32_t* ids, const void* const* table, int n_used, TokenBell* bell, unsigned* seq,
+               unsigned* cur, int32_t* all_ids, void* stream) {
+    bell_ring_kernel<<<1, 1, 0, cs(stream)>>>(visit, ids, table, n_used, bell, seq, cur, all_ids);
+}
+
+void bell_wait_add(const unsigned* cur, TokenBell* bell, const float* x, float* acc, int n, void* stream) {
+    bell_wait_add_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(cur, bell, x, acc, n);
 }
 
 void wait_host_flag(const unsigned* flag, unsigned want, unsigned* err, void* stream) {

@@ -1301,8 +1301,19 @@ void launch_attn_q(const AttnArgs& a, dim3 g, cudaStream_t st, bool kq8, bool vq
     else launch_attn<TQ, false, false>(a, g, st);
 }
 
+// inkling2 fork, INKLING2_ATTN_SPLITS=N (opt-in, 64 to 256): a token's most splits of a long context, more blocks to
+// read its keys with (kInklingMaxSplits, 64, else); other splits, so other bits
+int max_splits() {
+    static const int n = [] {
+        const char* v = std::getenv("INKLING2_ATTN_SPLITS");
+        const int k = v ? std::atoi(v) : 0;
+        return k >= kInklingMaxSplits && k <= 256 ? k : kInklingMaxSplits;
+    }();
+    return n;
+}
+
 int split_keys(long long room) {
-    const long long s = (room + kInklingMaxSplits - 1) / kInklingMaxSplits;
+    const long long s = (room + max_splits() - 1) / max_splits();
     return (int) std::max<long long>(AT_MIN_SPLIT, (s + AT_KEYS - 1) / AT_KEYS * AT_KEYS);
 }
 
@@ -2059,7 +2070,7 @@ void inkling_clip(const float* x, int x_stride, const float* scale, float* y, in
 }
 
 size_t inkling_attend_work_floats(int n_head, int dim) {
-    return size_t(kInklingSplitRows) * n_head * (kInklingMaxSplits + 2) * (dim + 2);
+    return size_t(kInklingSplitRows) * n_head * (max_splits() + 2) * (dim + 2);
 }
 
 namespace {
