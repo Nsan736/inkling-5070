@@ -123,6 +123,11 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
     (a checkpoint that is never dropped sits where the first turn ends). In a 60K conversation the turn after a
     compaction read 62 tokens instead of 6,977 (0.4 s instead of 4.2 s). `STRATA_SYS_CHECKPOINT=0` turns this off.
   - Send the tool definitions from the first turn on: adding them later changes the start, which is then read again.
+- When an answer copies text from the conversation (a file being edited), the engine guesses up to 31 tokens of what
+  follows and checks them at once (`--window 32`; 8 up to 0.3.2). Edit requests at 64K and 100K wrote 5-14% faster
+  than with 8 (search/replace blocks alone: ±2%). Text that copies little is as fast as before.
+  - Window 32 places slightly different experts in VRAM than window 8, so the output may not match it exactly (the
+    same kind of variation that happens between starts at the default).
 - More: [docs/measurements.md](docs/measurements.md)
 
 ## For long contexts: a 4-bit V cache (a little lower quality)

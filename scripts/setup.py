@@ -195,7 +195,7 @@ def choose(ram_total, vram_mib, vram_limit_mib, cores):
     # pinned RAM for a long prompt's rows (--read-mib): fewer passes over the prompt, so the experts outside VRAM
     # are copied fewer times (32K to 128K read 4-6% faster with 2-4 GiB on the PC above); only while reading
     read_mib = 2048 if ram_total >= 30 else 1024 if ram_total >= 15 else 512
-    args = ["--max-context", str(ctx + 1024), "--threads", str(threads), "--window", "8", "--lookup", "3",
+    args = ["--max-context", str(ctx + 1024), "--threads", str(threads), "--window", "32", "--lookup", "3",
             "--prompt-batch", str(batch), "--vram-reserve-mib", str(reserve), "--ram-experts-mib", str(ram_experts),
             "--read-mib", str(read_mib), "--kv", "q8_0"]
     return args, {"context": ctx, "prompt_batch": batch, "vram_reserve_mib": reserve, "ram_experts_mib": ram_experts,
