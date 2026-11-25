@@ -5020,6 +5020,18 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                 for (int k = 0; k < n_used_; ++k) sum += w[k] = std::exp(scores[ids[k]] - mx);
                 for (int k = 0; k < n_used_; ++k) w[k] /= sum;
             }
+            // inkling2 fork, INKLING2_ROUTE_LOG=FILE (opt-in): a written token's picks, a line a visit: the visit,
+            // its layer of experts, then each pick as expert:in VRAM (1/0)
+            static FILE* route_log = [] {
+                const char* p = std::getenv("INKLING2_ROUTE_LOG");
+                return p ? std::fopen(p, "w") : nullptr;
+            }();
+            if (route_log && n == 1 && !block_pass_) {
+                std::fprintf(route_log, "%d %d", visit, il);
+                for (int k = 0; k < n_used_; ++k)
+                    std::fprintf(route_log, " %d:%d", ids[k], L.slot[(size_t) ids[k]] != nullptr ? 1 : 0);
+                std::fputc('\n', route_log);
+            }
             float w_all = 0.f;
             for (int k = 0; k < n_used_; ++k) w_all += w[k];
             for (int k = 0; k < n_used_; ++k) {

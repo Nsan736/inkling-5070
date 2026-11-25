@@ -2,6 +2,8 @@
 
 依頼は 2 つ。題材はこのスクリプトで決まった形に作る一般的なもの (会話の記録などは使わない)。
   code   Python のモジュール (在庫の管理) の関数名を 1 つ変え、ファイル全体を返す
+  fix    同じモジュールの関数の中身を 2 か所直し、ファイル全体を返す
+  blocks 同じモジュールへの 3 つの変更を、置き換えのブロック (古い行の写しと新しい行) で返す
   jsonl  JSONL (本の一覧) の 1 行の値を変え、全体を返す
 文脈の長さ: 8k は依頼だけ (約 8K トークンになるよう前置きの資料を足す)、64k は前置きの資料を約 64K トークンにする。
 前置きの資料は bench/data の long_code (公開のソースコード) をトークナイザーで文字に戻したもの。
@@ -32,7 +34,7 @@ import strata_tokenizer  # noqa: E402
 
 LOG = "copy_window_engine.log"
 OUT = B.ROOT / "bench" / "logs" / "copy_window.jsonl"
-CTX = {"8k": 8192, "64k": 65536}
+CTX = {"8k": 8192, "64k": 65536, "100k": 102400}
 
 
 def code_file():
@@ -86,6 +88,16 @@ def jsonl_file():
 
 
 def task_text(task):
+    if task == "fix":   # an edit inside a function, the whole file back (most of it copied)
+        return ("In `value_of_hinges`, skip items whose price is negative, and in `report`, also print the price with "
+                "two decimals after the stock. Change nothing else. Return the complete file in one ```python block, "
+                "with no explanation.\n\n```python\n" + code_file() + "\n```")
+    if task == "blocks":   # search / replace blocks: the old lines copied, then the new ones
+        return ("Make these three changes to the file below: rename `restock_clamp` to `restock_clamps`; in "
+                "`save_items`, write with `indent=4`; in `load_items`, skip rows whose `stock` is missing. For each "
+                "change write one block in this form, with the old lines copied exactly and enough lines around them "
+                "to be unique:\n<<<<<<< SEARCH\n(old lines)\n=======\n(new lines)\n>>>>>>> REPLACE\n"
+                "Write only the blocks.\n\n```python\n" + code_file() + "\n```")
     if task == "code":
         return ("Rename the function `restock_spring` to `restock_springs` (only the definition; nothing calls it). "
                 "Change nothing else. Return the complete file in one ```python block, with no explanation.\n\n"
@@ -131,6 +143,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=3000)
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--label", default="")
+    ap.add_argument("--extra", default="", help='engine flags to add (e.g. "--lookup 2")')
+    ap.add_argument("--warm", type=int, default=256, help="tokens of a warm-up answer to the same prompt (0: none)")
     a = ap.parse_args()
     for kv in a.env:
         k, _, v = kv.partition("=")
@@ -145,15 +159,18 @@ def main():
             flags = list(B.BASE_FLAGS)
             flags[flags.index("--max-context") + 1] = str(CTX[ctx] + a.max_new + 1024)
             flags[flags.index("--window") + 1] = str(w)
-            e = U.Engine([str(B.EXE), "--model", str(B.MODEL), "--serve"] + flags + ["--kv", "q8_0"], log=LOG)
+            e = U.Engine([str(B.EXE), "--model", str(B.MODEL), "--serve"] + flags + ["--kv", "q8_0"] + a.extra.split(), log=LOG)
             try:
                 e.gen(16, "temperature=0", U.ids("gen.ids"))   # warm-up (not counted)
                 for t in a.tasks:
                     n = 216 if t == "text" else a.max_new
+                    if a.warm:   # the same prompt read and answered first (not counted): the expert cache settles
+                        gen_tokens(e, a.warm, prompts[t])
                     toks, d = gen_tokens(e, n, prompts[t])
                     produced, decode_ms, right = int(d[1]), float(d[4]), int(d[6])
                     passes = max(1, produced - right)
                     row = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "label": a.label, "ctx": ctx, "task": t,
+                           "extra": a.extra, "env": a.env, "ms": round(decode_ms, 1),
                            "window": w, "prompt": len(prompts[t]), "produced": produced,
                            "tps": round(1000.0 * produced / decode_ms, 2), "per_pass": round(produced / passes, 2),
                            "right": right, "offered": int(d[7]), "tokens": toks}

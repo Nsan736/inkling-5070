@@ -26,7 +26,7 @@ import copy_window as C     # noqa: E402
 LOG = "dspark_probe_engine.log"
 OUT = B.ROOT / "bench" / "logs" / "dspark_probe.jsonl"
 DRAFTER = B.ROOT / "models" / "official" / "mtp.safetensors"
-CTX = {"8k": 8192, "32k": 32768, "64k": 65536, "128k": 131072, "256k": 253000}
+CTX = {"8k": 8192, "32k": 32768, "64k": 65536, "100k": 102400, "128k": 131072, "256k": 253000}
 ASK = {
     "text": "Write a long, plain essay (no headings, no lists) about how small harbor towns changed when railways "
             "arrived: trade, work, food, daily life and what was lost. Write at least 800 words.",
@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--threads", type=int, default=0, help="--threads (0: bench.py's)")
     ap.add_argument("--reserve", type=int, default=0, help="--vram-reserve-mib (0: bench.py's)")
     ap.add_argument("--extra", default="", help='engine flags to add (e.g. "--loops 2")')
+    ap.add_argument("--cpus", default="", help="the engine process's logical CPUs, e.g. 0,1,6,7,8,9,18,19 (the P cores)")
     a = ap.parse_args()
     extra_env = dict(x.split("=", 1) for x in a.env)
     tok = C.strata_tokenizer.Tokenizer.from_dir(C.PUB / "data" / "tokenizer")
@@ -102,6 +103,9 @@ def main():
                 flags[flags.index("--vram-reserve-mib") + 1] = str(a.reserve)
             since = log_path.stat().st_size if log_path.exists() else 0
             e = U.Engine([str(B.EXE), "--model", str(B.MODEL), "--serve"] + flags + ["--kv", "q8_0"] + a.extra.split(), log=LOG)
+            if a.cpus:   # this process only: the logical CPUs it may run on (Windows' settings are left as they are)
+                import psutil
+                psutil.Process(e.p.pid).cpu_affinity([int(x) for x in a.cpus.split(",")])
             try:
                 e.gen(16, "temperature=0", U.ids("gen.ids"))   # warm-up (not counted)
                 for t in a.tasks:

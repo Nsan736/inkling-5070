@@ -84,11 +84,16 @@ public:
     /// the checkpoint before the prompt's last token is seldom where it goes on from.  A place the read does not
     /// pass adds none.
     void turn_at(int64_t at) { turn_ = at; }
+    /// inkling2 fork (opt-in, the server's sys_at= key): where the prompt's first turn ends (the system prompt and
+    /// the tools).  A checkpoint goes there too and stays (drop_of() passes it over): a conversation that a client
+    /// has compacted keeps that start and goes on from it.  -1: none.
+    void sys_at(int64_t at) { sys_ = at; }
 
     /// Of `want` tokens from position `at`, how many to read before the next checkpoint is due.
     int64_t until_checkpoint(int64_t at, int64_t want) const {
         if (o_.checkpoints < 1) return want;
         if (o_.every > 0) want = std::min(want, (at / o_.every + 1) * o_.every - at);
+        if (sys_ > at) want = std::min(want, sys_ - at);
         return turn_ > at ? std::min(want, turn_ - at) : want;
     }
 
@@ -96,7 +101,7 @@ public:
     /// due.  One sits before the last token of every prompt, so coming back to it leaves a token to read and the
     /// logits that come with it.
     void before(int64_t at, bool last) {
-        if (o_.checkpoints < 1 || at < 1 || (!last && at != turn_ && (o_.every < 1 || at % o_.every != 0))) return;
+        if (o_.checkpoints < 1 || at < 1 || (!last && at != turn_ && at != sys_ && (o_.every < 1 || at % o_.every != 0))) return;
         if (const BlobPtr b = mark(at)) e_.save_state(b->data());
     }
 
@@ -118,6 +123,8 @@ public:
             for (int64_t p = (at / o_.every + 1) * o_.every; p < at + n; p += o_.every) due.push_back(p);
         if (turn_ > at && turn_ < at + n && (o_.every < 1 || turn_ % o_.every != 0))
             due.insert(std::upper_bound(due.begin(), due.end(), turn_), turn_);
+        if (sys_ > at && sys_ < at + n && sys_ != turn_ && (o_.every < 1 || sys_ % o_.every != 0))
+            due.insert(std::upper_bound(due.begin(), due.end(), sys_), sys_);
         if (due.empty()) return;
         for (const Checkpoint& m : cur().marks) after_.push_back(m.pos);
         for (const int64_t p : due) {
@@ -480,10 +487,11 @@ private:
 
     // Of more checkpoints than are kept, the one that goes: the one whose neighbours are closest together.  The
     // last two stay, the end of this prompt and of the one before being where a client most often comes back to.
-    static size_t drop_of(const std::vector<int64_t>& pos) {
+    size_t drop_of(const std::vector<int64_t>& pos) const {
         size_t drop = 0;
         int64_t gap = INT64_MAX;
         for (size_t k = 0; k + 2 < pos.size(); ++k) {
+            if (sys_ > 0 && pos[k] == sys_ && pos.size() > 3) continue;   // inkling2 fork: sys_at()'s stays
             const int64_t g = pos[k + 1] - (k ? pos[k - 1] : 0);
             if (g < gap) gap = g, drop = k;
         }
@@ -642,6 +650,7 @@ private:
     std::vector<Checkpoint> due_;   // inside()'s checkpoints, until read() makes them the conversation's
     std::vector<int64_t> after_;    // where the conversation's checkpoints are once that read is done
     int64_t turn_ = -1;             // turn_at()'s place in the prompt being read; -1: none
+    int64_t sys_ = -1;              // inkling2 fork: sys_at()'s place; -1: none
 };
 
 }  // namespace strata::poly

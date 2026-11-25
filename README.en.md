@@ -119,6 +119,10 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
   - Against Q8_K_XL at 2K: mean KLD 0.0026, top-1 98.4%
 - A conversation's next turn reuses the start it shares with the last one: turn 2 of a 32K conversation read in
   0.23 s (15.6 s read again from the start).
+  - After an agent compacts the conversation, the system prompt and the tool definitions are not read again either
+    (a checkpoint that is never dropped sits where the first turn ends). In a 60K conversation the turn after a
+    compaction read 62 tokens instead of 6,977 (0.4 s instead of 4.2 s). `STRATA_SYS_CHECKPOINT=0` turns this off.
+  - Send the tool definitions from the first turn on: adding them later changes the start, which is then read again.
 - More: [docs/measurements.md](docs/measurements.md)
 
 ## For long contexts: a 4-bit V cache (a little lower quality)

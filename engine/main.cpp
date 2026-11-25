@@ -99,6 +99,7 @@ struct Sampling {
     bool ignore_eos = false;   // ignore_eos=1: an end token does not end the answer (a fixed number of tokens)
     bool times = false;        // times=1: a "TT <n> <us>" line after each T, the engine's clock when token n was shown
     bool no_lookup = false;    // lookup=0: this request guesses nothing from repeats (the engine's --lookup off for it)
+    int64_t sys_at = -1;       // inkling2 fork: sys_at=POS, where the first turn ends (Conversations::sys_at())
 };
 
 // llama.cpp's sampler chain in its default order: penalties, top-k, top-p, min-p, temperature, then the draw.
@@ -428,6 +429,7 @@ struct Session {
                          double(freed) / double(1ull << 30), had, engine.cached_experts());
         }
         kept.turn_at(turn_at);
+        kept.sys_at(s.sys_at);
         asked += n;
         reused += r.resume;
         on_progress(r.resume, n, 0.0, true);
@@ -623,6 +625,7 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
         else if (key == "ignore_eos") s.ignore_eos = std::atoi(v) != 0;
         else if (key == "times") s.times = std::atoi(v) != 0;
         else if (key == "lookup") s.no_lookup = std::atoi(v) == 0;
+        else if (key == "sys_at") s.sys_at = std::strtoll(v, nullptr, 10);
         else if (key == "image_pad") pad = (int32_t) std::atoi(v);
         else if (key == "turn_at") turn_at = std::strtoll(v, nullptr, 10);
         // other keys belong to the other engine and are skipped

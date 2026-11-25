@@ -1315,7 +1315,19 @@ class StrataEngine:
         checkpoint there, which the chat's next request goes on from; the Qwen3.8 engine skips the key and finds the
         place itself."""
         at = next((i for i in range(len(ids) - 1, 0, -1) if ids[i] in self.turn_ids), None)
-        return f" turn_at={at}" if at is not None else ""
+        key = f" turn_at={at}" if at is not None else ""
+        # inkling2 fork, on unless STRATA_SYS_CHECKPOINT=0: `sys_at=POS`, where the first turn ends: the first turn
+        # opener of another role than the prompt's first one (the system prompt with the tools, whose blocks all open
+        # with its own role's token).  strata-inkling2 keeps a checkpoint there, so that a compacted conversation,
+        # which keeps that start, goes on from it (60K: 6,977 tokens read again -> 62).
+        if os.environ.get("STRATA_SYS_CHECKPOINT", "1") != "0":
+            first = next((i for i in range(len(ids)) if ids[i] in self.turn_ids), None)
+            if first is not None:
+                sys_at = next((i for i in range(first + 1, len(ids)) if ids[i] in self.turn_ids and ids[i] != ids[first]),
+                              None)
+                if sys_at is not None and sys_at != at:
+                    key += f" sys_at={sys_at}"
+        return key
 
     def _send(self, text: str):
         btrace("send>", text[:60])
