@@ -517,6 +517,11 @@ private:
             for (uint32_t d = 0; d < nd; ++d) t.shape[d] = c.read<uint64_t>();
             t.type = c.read<uint32_t>();
             t.offset = c.read<uint64_t>();
+            // inkling2 fork: a quantization this engine has no block layout for (a newer one) stops the load here,
+            // named, rather than later as a size of 0
+            if (int be = 0, bb = 0; !block_geometry(t.type, be, bb))
+                throw std::runtime_error("GGUF: " + t.name + " has quantization type " + std::to_string(t.type) +
+                                         ", which this engine cannot read (an unsupported or newer quantization)");
             tensors_.push_back(std::move(t));
         }
         uint64_t align = 32;

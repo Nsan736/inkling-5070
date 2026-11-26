@@ -3,7 +3,7 @@
 The package holds bin\\ (strata-inkling2.exe, inkling2_logits_dump.exe, strata-vision.exe, the CUDA and C++ runtime DLLs they need),
 the server, the scripts, the docs and the licenses.  The model is not in it: setup.bat downloads it.
 
-  python tools/package.py [--version 0.3.5] [--build build]
+  python tools/package.py [--version 0.3.6] [--build build]
 
 Beside the zip it writes dist\SHA256SUMS.txt (the zip's SHA-256): every release carries it, and update.bat uses a
 download only if its SHA-256 is the one there.
@@ -55,7 +55,7 @@ def crt_dir():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", default="0.3.5")
+    ap.add_argument("--version", default="0.3.6")
     ap.add_argument("--build", default=str(ROOT / "build"))
     a = ap.parse_args()
     bin_src = Path(a.build) / "bin"

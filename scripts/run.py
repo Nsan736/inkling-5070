@@ -86,6 +86,14 @@ def main():
         if not Path(cfg[key]).exists():
             print(f"ERROR: {cfg[key]} is missing; run setup.bat again", flush=True)
             return 1
+    # the model the settings name: nothing is downloaded here, so a missing file is an error that says what to do
+    args = cfg.get("args") or []
+    model = Path(args[args.index("--model") + 1]) if "--model" in args else None
+    if model is None or not model.is_file():
+        print(f"ERROR: the model file {model} that {cfg_path.name} names is not there.", flush=True)
+        print("       Put it back, or point the settings at a copy you have: setup.bat --model-file PATH", flush=True)
+        print("       (setup.bat without --model-file downloads the default model, about 15.7 GB)", flush=True)
+        return 1
     port = a.port or int(cfg.get("port") or 8080)
     cmd = [sys.executable, "-I", str(ROOT / "server" / "serve" / "server.py"), "--engine", "strata", "--config",
            str(cfg_path), "--host", "127.0.0.1", "--port", str(port)]

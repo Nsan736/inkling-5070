@@ -1,6 +1,8 @@
 """setup.bat's work: check the PC, fetch the model, extract its tokenizer, choose the settings, write the config.
 
   python scripts/setup.py                      everything (the model download is about 15.7 GB)
+  python scripts/setup.py --model-file PATH    a GGUF you already have (no download; another quantization is accepted,
+                                               with a warning that it is not verified)
   python scripts/setup.py --configure-only     only choose the settings again (the model and tokenizer are there)
   python scripts/setup.py --limit-ram-gb 16 --limit-vram-gb 8   settings for a smaller PC (also to try them here)
 
@@ -41,6 +43,13 @@ for _key, _q, _size, _sha in (
     MODELS[_key] = {"file": f"Inkling-2-Mini-{_q}.gguf", "size": _size, "sha256": _sha, "repo": MODEL_REPO,
                     "url": f"https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REV}/Inkling-2-Mini-{_q}.gguf",
                     "display": f"Inkling 2 Mini {_q}"}
+# The ggml types the engine reads (gguf_reader.hpp's block_geometry): a file with another type cannot be loaded
+ENGINE_TYPES = {"F32", "F16", "BF16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K",
+                "Q6_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S", "IQ2_S", "IQ4_XS", "IQ1_M",
+                "I32", "I8", "NVFP4", "MXFP4", "Q2_0"}
+# The experts' types with GPU kernels (native_mmvq_supported); a layer of other types computes its experts on the CPU
+GPU_EXPERT_TYPES = {"Q4_0", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS",
+                    "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S", "IQ2_S", "IQ4_XS", "IQ1_M", "MXFP4", "NVFP4", "Q2_0"}
 HEADER_BYTES = 32 << 20   # the IQ4_XS GGUF's metadata (the tokenizer) lies in its first 32 MiB
 MIN_DRIVER = 580          # CUDA 13 runtime (the release is built with CUDA 13.3)
 MIN_CC = (7, 5)           # Turing and newer; the release has code for 7.5, 8.6, 8.9 and 12.0
@@ -125,6 +134,52 @@ def fetch_header(dst: Path):
     if len(data) != HEADER_BYTES:
         fail(f"the tokenizer's download stopped at {len(data)} of {HEADER_BYTES} bytes; run setup again")
     dst.write_bytes(data)
+
+
+def ask(question):
+    """A line typed in the console, or None when nobody can answer (no console: a script, a pipe)."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return None
+    try:
+        return input(question).strip()
+    except EOFError:
+        return None
+
+
+def inspect_model(path: Path):
+    """A GGUF the user has: its key in MODELS when it is one of the files setup knows (by name and size), else
+    "custom" after a check that the engine can read it (Inkling 2, ggml types it has).  Fails with what is wrong."""
+    if not path.is_file():
+        fail(f"{path} is not a file")
+    for k, v in MODELS.items():
+        if path.name == v["file"] and path.stat().st_size == v["size"]:
+            return k
+    sys.path.insert(0, str(ROOT / "server" / "tools"))
+    from gguf_reader import GGUFFile   # noqa: E402
+    try:
+        g = GGUFFile(path)
+    except Exception as e:   # noqa: BLE001
+        fail(f"{path.name} cannot be read as a GGUF file: {e}")
+    arch = g.metadata.get("general.architecture", "?")
+    if arch not in ("inkling2", "inkling2_loop"):
+        fail(f"{path.name} is a {arch} model, not Inkling 2 Mini")
+    types = g.by_type()
+    bad = [t for t in types if t not in ENGINE_TYPES]
+    if bad:
+        fail(f"{path.name} has tensors of {', '.join(bad)}, a quantization this engine cannot read "
+             f"(it reads {', '.join(sorted(ENGINE_TYPES - {'I32', 'I8'}))})")
+    experts = {}
+    for t in g.tensors:
+        if "_exps.weight" in t.name:
+            experts[t.type_name] = experts.get(t.type_name, 0) + 1
+    say(f"  WARNING: {path.name} is not one of the files setup was tested with: an unverified quantization.")
+    say(f"           Its tensors: {', '.join(f'{k} {v}' for k, v in types.items())}.")
+    say("           Its quality and speed were not measured; the estimates below do not apply to it.")
+    cpu = [t for t in experts if t not in GPU_EXPERT_TYPES]
+    if cpu:
+        say(f"           Experts of {', '.join(cpu)} have no GPU kernels here: those layers' experts run on the CPU "
+            "(slow).")
+    return "custom"
 
 
 def sha256(path, size=None):
@@ -271,7 +326,7 @@ def expect(key, g, budget_mib, chosen):
     """setup's estimate for the choice: VRAM, KV, RAM, experts in VRAM, speed; then other contexts and models."""
     say("== What to expect (estimates, not measurements of this PC)")
     if key not in SIZES:
-        say("  no estimate for Strata's SQ builds")
+        say("  no estimate for this model file (only for the files setup knows)")
         return
     if quality_note(key):
         say(f"  NOTE: {MODELS[key]['display']} is {quality_note(key)}; the default iq4_xs is the closest to Q8")
@@ -364,10 +419,34 @@ def main():
                     help="the context length instead of the chosen one: tokens, or 64k / 128k / 256k")
     ap.add_argument("--gpu", type=int, default=0, help="which NVIDIA GPU (nvidia-smi's index)")
     ap.add_argument("--config", default=str(ROOT / "config" / "inkling.json"))
-    ap.add_argument("--model", choices=sorted(MODELS), default="iq4_xs",
+    ap.add_argument("--model-file", default=None,
+                    help="a GGUF of Inkling 2 Mini you already have: no download. A file setup does not know "
+                         "(another quantization, e.g. IQ4_NL) is accepted with a warning that it is not verified")
+    ap.add_argument("--yes", action="store_true", help="overwrite an existing config\\inkling.json without asking")
+    ap.add_argument("--model", choices=sorted(MODELS), default=None,
                     help="iq4_xs (default: unsloth's UD-IQ4_XS GGUF), or unsloth's smaller q3_k_xl / q2_k_xl / "
                          "iq2_xxs (faster on 8 GB and 6 GB cards and at 256K, lower quality; checked at 2K only)")
     a = ap.parse_args()
+    cfg_path = Path(a.config)
+    old = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    if old and not a.yes:
+        got = ask(f"{cfg_path} exists. Overwrite it with new settings? [y/N] ")
+        if got is None or got.lower() not in ("y", "yes"):
+            say(f"Kept {cfg_path} as it is; nothing was changed. run.bat starts with it.")
+            say("  (setup.bat --yes overwrites it without asking)")
+            return 0
+    # The model: --model-file, else the one the old config used (when it is still there and --model asks for no
+    # other), else --model's file in --models-dir (downloaded if it is not there)
+    model_file = a.model_file
+    if not model_file and old and a.model is None:
+        try:
+            prev = Path(old["args"][old["args"].index("--model") + 1])
+        except (KeyError, ValueError, IndexError):
+            prev = None
+        if prev and prev.exists() and prev.parent.resolve() != Path(a.models_dir).resolve():
+            model_file = str(prev)
+            say(f"note: the model the settings used: {prev}")
+    a.model = a.model or "iq4_xs"
     m = MODELS[a.model]
     # --vision: cpu unless asked otherwise; when not asked for, a missing encoder (a build without it) is text only
     vision_asked = a.vision is not None
@@ -405,6 +484,29 @@ def main():
     models = Path(a.models_dir)
     models.mkdir(parents=True, exist_ok=True)
     model = models / m["file"]
+    have = model.exists() and model.stat().st_size == m["size"]
+    models_mmproj = models   # where the image encoder's weights are (or go)
+    if not model_file and not have and not a.configure_only:
+        got = ask(f"Do you already have the model? Type the path of its .gguf file (any quantization of Inkling 2 "
+                  f"Mini), or press Enter to download {m['file']} ({m['size'] / 1e9:.1f} GB): ")
+        if got:
+            model_file = got.strip('"')
+    if model_file:
+        say("== The model (a file you have)")
+        model = Path(model_file.strip('"')).expanduser().resolve()
+        key = inspect_model(model)
+        if key != "custom":
+            a.model, m = key, MODELS[key]
+            say(f"  {model}: {m['display']}")
+        else:
+            m = {"file": model.name, "size": model.stat().st_size, "display": f"Inkling 2 Mini ({model.stem})"}
+            a.model = "custom"
+        if (model.parent / VISION_MMPROJ["file"]).exists():   # the image encoder's weights beside the model
+            models_mmproj = model.parent
+        if a.vision == "cpu" and not vision_asked and not (models_mmproj / VISION_MMPROJ["file"]).exists():
+            say(f"  note: the image encoder's weights ({VISION_MMPROJ['file']}) are not in {models}: pictures stay "
+                "off (setup --vision cpu downloads them, 0.35 GB)")
+            a.vision = "off"
     free = shutil.disk_usage(models).free / 1e9
     say(f"  free disk space at {models}: {free:.1f} GB")
     exe = engine_exe()
@@ -413,12 +515,17 @@ def main():
 
     if not a.configure_only:
         say("== The model")
-        size, want = m["size"], m["sha256"]
+        size, want = m["size"], m.get("sha256")
         part_path = model.with_suffix(model.suffix + ".part")
-        if model.exists() and model.stat().st_size == size and (models / (m["file"] + ".ok")).exists():
+        if a.model == "custom":
+            say(f"  {model}: not checked (setup has no SHA-256 for it)")
+        elif model.exists() and model.stat().st_size == size and (models / (m["file"] + ".ok")).exists():
             say(f"  {model} is there and was checked before")
         else:
             if not (model.exists() and model.stat().st_size == size):
+                if model_file:
+                    fail(f"{model} is not the size of {m['file']}; give the right file, or run setup without "
+                         "--model-file to download it")
                 need = (size - (part_path.stat().st_size if part_path.exists() else 0)) / 1e9 + 1
                 if free < need:
                     fail(f"{need:.1f} GB of free disk space is needed at {models}")
@@ -434,7 +541,7 @@ def main():
         if not (tok / "vocab.json").exists():
             (ROOT / "data").mkdir(exist_ok=True)
             src = model if model.suffix == ".gguf" else models / MODEL_FILE   # every GGUF carries the tokenizer
-            if not (src.exists() and src.stat().st_size in (MODEL_SIZE, m["size"])):   # a model without a GGUF: the IQ4_XS GGUF's metadata alone
+            if not (src.exists() and (a.model == "custom" or src.stat().st_size in (MODEL_SIZE, m["size"]))):   # a model without a GGUF: the IQ4_XS GGUF's metadata alone
                 src = models / (MODEL_FILE + ".header")
                 if not (src.exists() and src.stat().st_size == HEADER_BYTES):
                     fetch_header(src)
@@ -443,7 +550,7 @@ def main():
         say(f"  {tok}")
         if a.vision == "cpu":
             say("== The image encoder")
-            mp = models / VISION_MMPROJ["file"]
+            mp = models_mmproj / VISION_MMPROJ["file"]
             if not (mp.exists() and mp.stat().st_size == VISION_MMPROJ["size"] and (models / (mp.name + ".ok")).exists()):
                 if not (mp.exists() and mp.stat().st_size == VISION_MMPROJ["size"]):
                     download(mp, VISION_MMPROJ)
@@ -452,7 +559,8 @@ def main():
                 (models / (mp.name + ".ok")).write_text(VISION_MMPROJ["sha256"])
             say(f"  {mp}")
     elif not model.exists():
-        fail(f"{model} is missing; run setup.bat without --configure-only first")
+        fail(f"{model} is missing: run setup.bat without --configure-only (it downloads it), or setup.bat "
+             "--model-file PATH for a copy you have")
 
     say("== Settings")
     vram_limit = int(a.limit_vram_gb * 1024) if a.limit_vram_gb else g["vram_mib"]
@@ -472,8 +580,6 @@ def main():
         say(f"  {k}: {v}")
     say(f"  thinking: {a.thinking} (for requests that send no reasoning_effort)")
     expect(a.model, g, min(vram_limit, g["vram_mib"]), chosen)
-    cfg_path = Path(a.config)
-    old = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
     port = a.port or old.get("port") or DEFAULT_PORT
     cfg = {"exe": str(exe), "cwd": str(ROOT), "tokenizer": str(ROOT / "data" / "tokenizer"),
            "model_name": "inkling-2-mini", "display_name": m["display"], "model_choice": a.model,
@@ -484,7 +590,7 @@ def main():
     if a.gpu:
         cfg["gpu"], cfg["gpus_asked"] = a.gpu, True   # the server tells the engine this card
     if a.vision == "cpu":
-        vexe, mp = vision_exe(), models / VISION_MMPROJ["file"]
+        vexe, mp = vision_exe(), models_mmproj / VISION_MMPROJ["file"]
         if not mp.exists():
             if vision_asked:
                 fail(f"{mp} is missing; run setup.bat --vision cpu without --configure-only first")

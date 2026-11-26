@@ -252,10 +252,14 @@ trained with a different loop count.
 
 1. Unpack the release zip (or build, below).
 2. `setup.bat`: checks the GPU/driver/RAM/disk, downloads the model (resumable) and the image encoder's weights (0.35 GB; `--vision off`: none) and checks their SHA-256, creates
-   `.venv` with the server's Python packages, and writes the settings to `config\inkling.json`. At the end it prints
+   `.venv` with the server's Python packages, and writes the settings to `config\inkling.json`. A model you already
+   have: type its path when setup asks before the download, or `setup.bat --model-file PATH` (below). Existing
+   settings are overwritten only if you say so (`--yes`: without asking). At the end it prints
    estimates for the choice (usable VRAM, KV cache size, experts in VRAM) and tables of other context lengths and
    models with the speeds measured above.
-3. `run.bat`: an OpenAI-compatible server (Chat Completions, Responses, Anthropic Messages, a chat page) on
+3. `run.bat`: without settings (`config\inkling.json`) it runs `setup.bat` first; with them it starts as they say
+   and downloads nothing (a model file the settings name that is not there: it stops and says what to do). It is an
+   OpenAI-compatible server (Chat Completions, Responses, Anthropic Messages, a chat page) on
    `http://127.0.0.1:8080`, local only. After the start and after each request it prints the experts in VRAM, their
    share and the hit rate (`--quiet` leaves that out).
 
@@ -271,6 +275,8 @@ A request that sends no thinking level thinks at `medium` (`setup.bat --thinking
 | Option | |
 |---|---|
 | `setup.bat --model NAME` | `iq4_xs` (default) / `q3_k_xl` / `q2_k_xl` / `iq2_xxs` |
+| `setup.bat --model-file PATH` | a GGUF you have (no download; other quantizations too) |
+| `setup.bat --yes` | overwrite existing settings without asking |
 | `setup.bat --vision off` | no pictures (default `cpu`: the image encoder on the CPU) |
 | `setup.bat --vision-max-tokens N` | the most tokens a picture takes (default 1,024; larger ones are scaled down) |
 | `setup.bat --thinking LEVEL` | the thinking level of requests that send none: `low` / `medium` (default) / `high` |
@@ -284,6 +290,28 @@ A request that sends no thinking level thinks at `medium` (`setup.bat --thinking
 Settings setup chooses by usable VRAM: 128K context / 2,048-token prompt batches from 12 GB (256K with
 `--context 256k`: 1,024), 64K / 1,024 from 10 GB, 32K / 1,024 from 8 GB, 16K / 512 below; experts in RAM = RAM - 14 GB
 (max 9 GB); up to 12 CPU threads.
+
+### Using a model you have
+
+- Point setup at the GGUF: `setup.bat --model-file C:\models\Inkling-2-Mini-UD-IQ4_XS.gguf`.
+  - Nothing is downloaded, and the file stays where it is (the settings name its path).
+  - A file on setup's list (same name and size) gets its SHA-256 checked (a minute or two).
+  - Plain `setup.bat` asks for a path before it downloads (Enter downloads).
+- After moving the file: `setup.bat --model-file NEW_PATH --yes`.
+- Once set with `--model-file`, `setup.bat --yes` (to change the context, say) keeps using that file.
+- Without the image encoder's weights in `models\`, pictures are turned off (`setup.bat --vision cpu` downloads them).
+
+### Another quantization
+
+- A GGUF of a quantization setup does not list (IQ4_NL, say) works with `setup.bat --model-file PATH`.
+  - setup reads the file and checks it is Inkling 2 and made only of types the engine reads.
+  - It warns that the quantization is not verified: its quality and speed were not measured (nor do setup's estimates
+    apply).
+  - A layer whose experts are of a type without GPU kernels computes them on the CPU (slow); setup says which.
+- Types the engine reads: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K-Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+  IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4, NVFP4, Q2_0. With another (TQ1_0, ...), setup and the engine stop and
+  name it.
+- Back to the default model: `setup.bat --model iq4_xs --yes` (no download if it is in `models\`).
 
 ### Updating (`update.bat`, from 0.3.5)
 
