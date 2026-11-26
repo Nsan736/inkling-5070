@@ -16,6 +16,16 @@
 #include <string>
 #include <type_traits>
 
+// inkling2 fork, INKLING2_PDL: a kernel waits here for the grids before it to be done when it was launched as a
+// programmatic dependent (Engine::record()); otherwise the instruction returns at once
+// INKLING2_PDL_EARLY=1: the grids after it may start as soon as every block of this one has
+static __constant__ int ink_pdl_early_;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define INK_PDL_WAIT() do { asm volatile("griddepcontrol.wait;" ::: "memory"); if (ink_pdl_early_) asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); } while (0)
+#else
+#define INK_PDL_WAIT() ((void) 0)
+#endif
+
 namespace strata::poly {
 namespace {
 
@@ -201,6 +211,7 @@ __device__ __forceinline__ void clip_group(const float* __restrict__ x, int x_st
 __global__ void clip_kernel(const float* __restrict__ x, int x_stride, const float* __restrict__ scale,
                             float* y, int dim, int heads, int groups, float threshold, float alpha, int floor_,
                             long long pos) {
+    INK_PDL_WAIT();
     const int gi = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     if (gi >= groups) return;
     clip_group(x, x_stride, scale, y, dim, heads, gi, threshold, alpha, floor_, pos);
@@ -244,6 +255,7 @@ __device__ __forceinline__ void clip_many_group(const ClipJobs& c, int count, co
 
 template <class From>
 __global__ void clip_many_kernel(ClipJobs c, int count, From from) {
+    INK_PDL_WAIT();
     clip_many_group(c, count, from, blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP);
 }
 
@@ -271,6 +283,10 @@ struct AttnArgs {
     const float* gate;   // the split path's output gate: out = o * sigmoid(gate) (null: none)
     void* out_q8_1;      // the split path's output's Q8_1 blocks too (null: none)
     float* work;
+    // inkling2 fork, INKLING2_ATTN_TOKEN_FAST=1 (opt-in): attn_dec_kernel's grid as (tokens, groups, splits), so
+    // that the blocks of a split's keys for a window's tokens run side by side and read the keys from L2, not
+    // from VRAM once a token; the same blocks, the same sums
+    int tok_fast;
 };
 
 // inkling2 fork, --kv k8v4: a cache's values are fp16 (Q 0), Q8_0 (1) or 4-bit codes (2: Kvq8::bits 4, two a byte).
@@ -319,6 +335,7 @@ constexpr size_t attn_smem(int tq) {
 // max stays).
 template <int TQ, bool KQ8, int VQ8>
 __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
+    INK_PDL_WAIT();
     constexpr int R = TQ * AT_PER;
     constexpr int RPT = (R * AT_KEYS + AT_THREADS - 1) / AT_THREADS;   // scores a thread per tile
     extern __shared__ float smem[];
@@ -490,6 +507,7 @@ inline int rows_from(const AttnSeqs& s, const AttnArgs&, int ntok, int from) {
 // value dimension.  A row of one split has its output from attn_dec_kernel.
 template <class Rows>
 __global__ void attn_join_kernel(AttnArgs a, Rows rows) {
+    INK_PDL_WAIT();
     const int th = blockIdx.x, d = threadIdx.x;
     const AttnRow row = rows.row(a, th / a.n_head);
     const int nslot = row.nslot;
@@ -550,18 +568,20 @@ __device__ __forceinline__ void load4(const half* c, const Kvq8& q8, size_t i, f
 
 template <bool KQ8, int VQ8, class Rows>
 __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs a, Rows rows) {
+    INK_PDL_WAIT();
     __shared__ float sm_m[DEC_WARPS][AT_PER], sm_l[DEC_WARPS][AT_PER];
     __shared__ float sm_o[DEC_WARPS][AT_PER][AT_DIM];
     __shared__ __align__(16) float sm_q[AT_PER][AT_DIM];
     const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
     const int sub = lane % DEC_LANES, mine = lane / DEC_LANES;   // the score's lanes: key `mine` of a step
-    const int g = blockIdx.y, t = blockIdx.z, n_rel = a.rel.n_rel;
+    const int g = blockIdx.y, t = a.tok_fast ? blockIdx.x : blockIdx.z, n_rel = a.rel.n_rel;
+    const int bs = a.tok_fast ? blockIdx.z : blockIdx.x;   // the block's split
     const AttnRow r = rows.row(a, t);
-    if ((int) blockIdx.x >= r.nslot) return;   // a row with fewer splits than the call's most
+    if (bs >= r.nslot) return;   // a row with fewer splits than the call's most
     if (a.i8_from > 0 && r.split >= a.i8_from) return;   // attn_dec_i8_kernel's row
     const int p = int(r.pos);
     const int lo = a.window > 0 && p >= a.window ? p - a.window + 1 : 0;
-    const int s = lo / r.split + blockIdx.x;
+    const int s = lo / r.split + bs;
     const int kb = max(lo, s * r.split), ke = min(p + 1, (s + 1) * r.split);
     // the queries in shared memory; share j = sub + DEC_LANES * k of each head's bias weight
     float rr[AT_PER][DEC_SHARES], m[AT_PER], l[AT_PER], acc[AT_PER][4];
@@ -715,7 +735,7 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs 
         }
         const size_t th = size_t(t) * a.n_head + g * AT_PER + h;
         if (r.nslot > 1) {
-            float* wp = a.work + (th * a.nslot + blockIdx.x) * (AT_DIM + 2);
+            float* wp = a.work + (th * a.nslot + bs) * (AT_DIM + 2);
             if (d == 0) wp[0] = M, wp[1] = L;
             wp[2 + d] = O;
         } else {
@@ -766,6 +786,7 @@ __device__ __forceinline__ void codes4(int w, float* x) {
 
 template <class Rows>
 __global__ void __launch_bounds__(I8_WARPS * WARP) attn_dec_i8_kernel(AttnArgs a, Rows rows) {
+    INK_PDL_WAIT();
     __shared__ float sm_m[I8_WARPS][AT_PER], sm_l[I8_WARPS][AT_PER];
     __shared__ float sm_o[I8_WARPS][AT_PER][AT_DIM];
     const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP, sub = lane % I8_LANES;
@@ -1056,6 +1077,7 @@ static_assert(16 * MMA_WARPS / AT_PER * AT_PER >= 16 * MMA_WARPS - 2, "attn_mma_
 // prompt reads at 128K; held, the three take the same time (F16 1 and 2 about 1% faster than the floats).
 template <bool KQ8, int VQ8, int F16 = 0>
 __global__ void __launch_bounds__(MMA_WARPS * WARP, (F16 & 3) >= 1 ? 3 : 0) attn_mma_kernel(AttnArgs a) {
+    INK_PDL_WAIT();
 #if INKLING_MMA
     __shared__ __align__(16) half ks[MMA_KEYS][MMA_KROW], vs[MMA_KEYS][MMA_KROW];
     __shared__ __align__(16) half slice[MMA_SLICE][MMA_TROW];
@@ -1330,18 +1352,25 @@ template <class Rows>
 void launch_dec(const AttnArgs& a, const Rows& rows, int ntok, bool kq, bool vq, bool vq4, bool int8_dot,
                 cudaStream_t st) {
     const dim3 gd((unsigned) a.nslot, a.kv_heads, ntok);
+    static const bool tok_fast = [] {
+        const char* v = std::getenv("INKLING2_ATTN_TOKEN_FAST");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    AttnArgs f = a;   // INKLING2_ATTN_TOKEN_FAST: attn_dec_kernel's grid with the tokens first
+    f.tok_fast = tok_fast && ntok > 1 ? 1 : 0;
+    const dim3 gf = f.tok_fast ? dim3((unsigned) ntok, a.kv_heads, (unsigned) a.nslot) : gd;
     if (vq4) {   // inkling2 fork, --kv k8v4 (Q8_0 keys); STRATA_KV_INT8's kernel reads 8-bit values only
-        attn_dec_kernel<true, 2, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+        attn_dec_kernel<true, 2, Rows><<<gf, DEC_WARPS * WARP, 0, st>>>(f, rows);
     } else if (int8_dot && kq && vq && a.window <= 0) {   // a full layer's rows of long splits by __dp4a, the others not
         AttnArgs b = a;
         b.i8_from = I8_MIN_SPLIT;
         const int big = rows_from(rows, a, ntok, I8_MIN_SPLIT);
         if (big > 0) attn_dec_i8_kernel<Rows><<<gd, I8_WARPS * WARP, 0, st>>>(b, rows);
         if (big < ntok) attn_dec_kernel<true, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(b, rows);
-    } else if (kq && vq) attn_dec_kernel<true, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
-    else if (kq) attn_dec_kernel<true, false, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
-    else if (vq) attn_dec_kernel<false, true, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
-    else attn_dec_kernel<false, false, Rows><<<gd, DEC_WARPS * WARP, 0, st>>>(a, rows);
+    } else if (kq && vq) attn_dec_kernel<true, true, Rows><<<gf, DEC_WARPS * WARP, 0, st>>>(f, rows);
+    else if (kq) attn_dec_kernel<true, false, Rows><<<gf, DEC_WARPS * WARP, 0, st>>>(f, rows);
+    else if (vq) attn_dec_kernel<false, true, Rows><<<gf, DEC_WARPS * WARP, 0, st>>>(f, rows);
+    else attn_dec_kernel<false, false, Rows><<<gf, DEC_WARPS * WARP, 0, st>>>(f, rows);
     check_launch("inkling_attend");
     if (a.nslot > 1) {   // a row of one split: the block wrote the token's output itself
         attn_join_kernel<Rows><<<ntok * a.n_head, AT_DIM, 0, st>>>(a, rows);
@@ -1392,6 +1421,7 @@ template <bool ACC, class Rows>
 __global__ void conv_walk_kernel(const float* __restrict__ x, Rows rows, const float* __restrict__ w,
                                  const float* __restrict__ taps, int heads, float* __restrict__ out, int channels,
                                  float scale) {
+    INK_PDL_WAIT();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const float* wc = w + 4 * size_t(c);
@@ -1417,6 +1447,7 @@ template <bool ACC>
 __global__ void conv_rows_kernel(const float* __restrict__ x, const float* __restrict__ state,
                                  const float* __restrict__ w, const float* __restrict__ taps, int heads,
                                  float* __restrict__ out, int channels, int row0, float scale) {
+    INK_PDL_WAIT();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int row = row0 + blockIdx.y;
@@ -1430,6 +1461,7 @@ __global__ void conv_rows_kernel(const float* __restrict__ x, const float* __res
 }
 
 __global__ void conv_state_kernel(const float* __restrict__ x, float* __restrict__ state, int channels, int rows) {
+    INK_PDL_WAIT();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     float* st = state + size_t(c) * 3;
@@ -1449,6 +1481,7 @@ struct Snaps {
 };
 __global__ void conv_snaps_kernel(const float* __restrict__ x, const float* __restrict__ state, int channels,
                                   Snaps snaps, float* __restrict__ snap, size_t stride) {
+    INK_PDL_WAIT();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int t = snaps.t[blockIdx.y];
@@ -1470,6 +1503,7 @@ constexpr int MIX_SUMS = kInklingMaxStates * 5;   // a state's sum of squares an
 // A block a token, in one pass over the states: every state's sum of squares and its dots with the raw queries
 // together (s_hat . q = inv * (s . q)), the block's sums of all of them at once, the softmaxes, then the outputs.
 __global__ void __launch_bounds__(MIX_THREADS) mix_kernel(InklingMix m, int n, float eps) {
+    INK_PDL_WAIT();
     __shared__ float part[MIX_THREADS / WARP][MIX_SUMS];
     __shared__ float tot[MIX_SUMS];
     __shared__ float wts[4][kInklingMaxStates];
@@ -1630,6 +1664,7 @@ __device__ __forceinline__ void mix4_body(const InklingMix& m, int n, float eps,
 
 template <int NS>
 __global__ void __launch_bounds__(MIX4_MAX) mix4_kernel(InklingMix m, int n, float eps) {
+    INK_PDL_WAIT();
     __shared__ Mix4Smem sm;
     mix4_body<NS>(m, n, eps, blockIdx.x, Given{}, sm);
 }
@@ -1682,6 +1717,7 @@ __device__ __forceinline__ float conv_in_one(const ConvIn& c, int n, int ch, flo
 }
 
 __global__ void conv_in_kernel(ConvIn c, int n) {
+    INK_PDL_WAIT();
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= n) return;
     const float old = c.acc[ch];
@@ -1706,6 +1742,7 @@ struct MixNorms {
 // normed as native_add_rms_norm_q8_1_kernel<SUM> norms them, each with its own weight.
 template <int SUM>
 __global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c, MixNorms nr, int n, float eps) {
+    INK_PDL_WAIT();
     __shared__ Mix4Smem sm;
     __shared__ float part[SUM > 0 ? SUM / WARP : 1];
     const InklingMix& m = mp.m[blockIdx.x];
@@ -1739,10 +1776,197 @@ __global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c
 }
 static_assert(MIX_CONV_STATES == 5, "mix_conv_kernel's cases");
 
+// inkling2 fork, INKLING2_MIX_CLUSTER=C (opt-in): mix_conv_kernel's work over a cluster of C blocks a mix.  The whole
+// vector's threads are mix_conv_kernel's block's, cut in C runs of whole warps: thread i still has float4 i, and a
+// warp's sums are the same.  The warps' sums are added in their order from every block's shared memory (DSMEM), as
+// the one block adds them; the norms' threads are SUM threads in turn as fm::rms_norm_q8_1 takes them, a warp one
+// of their warps, reading the mix's output from the blocks that made it.  The same bits, in C times the SMs.
+// a cluster's rank, its barrier (release / acquire), and a load from the shared memory of a block of it
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900   // clusters: sm_90 and newer
+__device__ __forceinline__ unsigned cl_rank() {
+    unsigned r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+    return r;
+}
+__device__ __forceinline__ void cl_sync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+__device__ __forceinline__ unsigned cl_at(const void* p, unsigned rank) {
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    unsigned r;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank));
+    return r;
+}
+__device__ __forceinline__ float cl_ld(const float* p, unsigned rank) {
+    float v;
+    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(cl_at(p, rank)) : "memory");
+    return v;
+}
+#else   // older cards never launch the cluster kernels (the launch checks the card); these keep them compiling
+__device__ __forceinline__ unsigned cl_rank() { return 0; }
+__device__ __forceinline__ void cl_sync() { __syncthreads(); }
+__device__ __forceinline__ float cl_ld(const float* p, unsigned) { return *p; }
+#endif
+
+struct MixClSmem {
+    float part[MIX4_MAX / WARP][MIX4_SUMS];
+    float tot[MIX4_SUMS];
+    float wts[4][kInklingMaxStates];
+    float npart[4][1024 / WARP];
+};
+
+template <int NS, int C>
+__device__ __forceinline__ void mix_cl_body(const InklingMix& m, int n, float eps, const Given& given, MixClSmem& sm,
+                                            float4* ys, int ys_stride) {
+    constexpr int SUMS = NS * 5;
+    const int nq = m.n_query, lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
+    const int i = int(cl_rank()) * blockDim.x + threadIdx.x, n4 = n / 4;
+    const bool own = i < n4;
+    float4 xs[NS];
+    float acc[SUMS];
+#pragma unroll
+    for (int j = 0; j < SUMS; ++j) acc[j] = 0.0f;
+    if (own) {
+        float4 qv[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            qv[q] = q < nq ? reinterpret_cast<const float4*>(m.query + size_t(q) * n)[i] : make_float4(0, 0, 0, 0);
+#pragma unroll
+        for (int k = 0; k < NS; ++k) xs[k] = given.at(m.state[k], i);
+#pragma unroll
+        for (int k = 0; k < NS; ++k) {
+            const float4 x = xs[k];
+            acc[k * 5] = x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+                acc[k * 5 + 1 + q] = x.x * qv[q].x + x.y * qv[q].y + x.z * qv[q].z + x.w * qv[q].w;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < SUMS; ++j) {
+        const float v = warp_sum(acc[j]);
+        if (lane == 0) sm.part[warp][j] = v;
+    }
+    cl_sync();
+    const int bw = blockDim.x / WARP, warps = bw * C;
+    for (int j = threadIdx.x; j < SUMS; j += blockDim.x) {
+        float v = 0.0f;
+        for (int w = 0; w < warps; ++w) v += cl_ld(&sm.part[w % bw][j], unsigned(w / bw));
+        sm.tot[j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        const int q = threadIdx.x;
+        const float scale = 1.0f / sqrtf((float) n);
+        float sc[NS], inv[NS], mx = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < NS; ++k) {
+            inv[k] = 1.0f / sqrtf(sm.tot[k * 5] / float(n) + eps);
+            sc[k] = sm.tot[k * 5 + 1 + q] * inv[k] * scale;
+            mx = fmaxf(mx, sc[k]);
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int k = 0; k < NS; ++k) sum += (sc[k] = expf(sc[k] - mx));
+#pragma unroll
+        for (int k = 0; k < NS; ++k) sm.wts[q][k] = sc[k] / sum * inv[k];
+    }
+    __syncthreads();
+    if (!own) return;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        if (q >= nq) break;
+        float4 y = make_float4(0, 0, 0, 0);
+#pragma unroll
+        for (int k = 0; k < NS; ++k) {
+            const float w = sm.wts[q][k];
+            y.x += w * xs[k].x, y.y += w * xs[k].y, y.z += w * xs[k].z, y.w += w * xs[k].w;
+        }
+        reinterpret_cast<float4*>(m.out[q])[i] = y;
+        if (ys) ys[q * ys_stride + threadIdx.x] = y;
+    }
+}
+
+template <int SUM, int C>
+__global__ void __launch_bounds__(MIX4_MAX) mix_conv_cl_kernel(MixPair mp, ConvIn c, MixNorms nr, int n, float eps) {
+    INK_PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900   // clusters: sm_90 and newer (the launch checks the card)
+    __shared__ MixClSmem sm;
+    __shared__ float4 ys[SUM > 0 ? 4 * (MIX4_MAX / C) : 1];   // the mix's outputs of this block's float4s (norms)
+    const int mix = blockIdx.x / C, rank = int(cl_rank());
+    const InklingMix& m = mp.m[mix];
+    const int i = rank * blockDim.x + threadIdx.x;
+    const bool norms = SUM > 0 && mix == 0;
+    Given g;
+    if (mix == 0 && c.acc && i < n / 4) {
+        float4* a4 = reinterpret_cast<float4*>(c.acc) + i;
+        const float4 old = *a4;
+        if (c.save) reinterpret_cast<float4*>(c.save)[i] = old;
+        float4 y;
+        y.x = conv_in_one(c, n, 4 * i, old.x);
+        y.y = conv_in_one(c, n, 4 * i + 1, old.y);
+        y.z = conv_in_one(c, n, 4 * i + 2, old.z);
+        y.w = conv_in_one(c, n, 4 * i + 3, old.w);
+        *a4 = y;
+        g.p[0] = c.acc, g.v[0] = y;
+        g.p[1] = c.save, g.v[1] = old;
+    }
+    float4* mine = norms ? ys : nullptr;
+    const int stride = MIX4_MAX / C;
+    switch (m.n_state) {
+        case 1: mix_cl_body<1, C>(m, n, eps, g, sm, mine, stride); break;
+        case 2: mix_cl_body<2, C>(m, n, eps, g, sm, mine, stride); break;
+        case 3: mix_cl_body<3, C>(m, n, eps, g, sm, mine, stride); break;
+        case 4: mix_cl_body<4, C>(m, n, eps, g, sm, mine, stride); break;
+        default: mix_cl_body<5, C>(m, n, eps, g, sm, mine, stride); break;
+    }
+    if constexpr (SUM > 0) {
+        cl_sync();   // every block's outputs
+        if (norms) {
+            const int lane = threadIdx.x % WARP, warp = threadIdx.x / WARP, bw = blockDim.x / WARP;
+            const int per = blockDim.x * 4;   // floats of a block's ys row
+            // the float at e of query q, from the block that made it
+            const auto at = [&](int q, int e) {
+                const int r = e / per, o = e % per;
+                return cl_ld(reinterpret_cast<const float*>(&ys[q * stride + o / 4]) + o % 4, unsigned(r));
+            };
+            constexpr int VW = SUM / WARP;
+            for (int q = 0; q < m.n_query; ++q) {
+                for (int vw = rank * bw + warp; vw < VW; vw += C * bw) {
+                    const int t = vw * WARP + lane;
+                    float ss = 0.0f;
+                    for (int e = t; e < n; e += SUM) {
+                        const float v = at(q, e);
+                        ss = fm::fma_rn(v, v, ss);
+                    }
+                    ss = fm::warp_sum(ss);   // fm::rms_norm_q8_1's
+                    if (lane == 0) sm.npart[q][vw] = ss;
+                }
+            }
+            cl_sync();
+            for (int q = 0; q < m.n_query; ++q) {
+                float sum = 0.0f;
+                for (int k = 0; k < VW; ++k) sum = fm::add_rn(sum, cl_ld(&sm.npart[q][k], unsigned((k / bw) % C)));
+                const float scale = fm::div_rn(1.0f, fm::sqrt_rn(fm::add_rn(fm::div_rn(sum, float(n)), nr.eps)));
+                for (int blk = rank * bw + warp; blk < n / WARP; blk += C * bw) {
+                    const int e = blk * WARP + lane;
+                    const float xi = fm::mul_rn(fm::mul_rn(at(q, e), scale), nr.w[q][e]);
+                    nr.y[q][e] = xi;
+                    fm::q8_1(xi, nr.yq[q] + blk);
+                }
+            }
+        }
+    }
+    cl_sync();   // no block leaves while another reads its shared memory
+#endif
+}
+
 // ---- controller, SiTU ------------------------------------------------------------------------------------------
 
 __global__ void ctrl_mix_kernel(const float* cur, const float* __restrict__ msg, const float* __restrict__ gain,
                                 const float* __restrict__ forget, float* out, size_t n) {
+    INK_PDL_WAIT();
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float c = cur[i];
@@ -1763,6 +1987,7 @@ __device__ __forceinline__ float2 row_scales(const ExpertScales& s, int row) {
 
 __global__ void situ_rows_kernel(const float* __restrict__ gate_up, float* __restrict__ out, int n, float beta,
                                  float lb, ExpertScales s) {
+    INK_PDL_WAIT();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
@@ -1773,6 +1998,7 @@ __global__ void situ_rows_kernel(const float* __restrict__ gate_up, float* __res
 // situ_rows_kernel's values, not stored, into their Q8_1 blocks (n a multiple of 32: a warp is a block).
 __global__ void situ_q8_1_kernel(const float* __restrict__ gate_up, fm::Q81* __restrict__ q, int n, float beta,
                                  float lb, ExpertScales s) {
+    INK_PDL_WAIT();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
@@ -1804,6 +2030,7 @@ struct CtrlArgs {
 // The norms of cur and msg and output o of the down projection, for every row: down[o] . [cur / rms, msg / rms] is
 // (down_left[o] . cur) / rms(cur) + (down_right[o] . msg) / rms(msg).  A block an output of a controller.
 __global__ void __launch_bounds__(CTRL_THREADS) ctrl_down_kernel(CtrlArgs a) {
+    INK_PDL_WAIT();
     __shared__ float part[CTRL_THREADS / WARP][4 * CTRL_ROWS];
     const int o = blockIdx.x, k = blockIdx.y, n = a.n, rows = a.rows;
     const float* cur = a.cur[k];
@@ -1845,6 +2072,7 @@ __global__ void __launch_bounds__(CTRL_THREADS) ctrl_down_kernel(CtrlArgs a) {
 // gain and forget of CTRL_OUT outputs of a controller (a warp four of them, a lane two of the rank's values), and
 // the combine: out = (cur - tanh(forget) * cur) + tanh(gain) * msg.
 __global__ void __launch_bounds__(CTRL_THREADS) ctrl_up_kernel(CtrlArgs a) {
+    INK_PDL_WAIT();
     __shared__ float r[CTRL_ROWS][kInklingMaxRank];
     const int k = blockIdx.y, n = a.n, rows = a.rows, rank = a.rank;
     for (int i = threadIdx.x; i < rows * rank; i += CTRL_THREADS)
@@ -1886,6 +2114,7 @@ __global__ void __launch_bounds__(GEMV_WARPS * WARP) gemv_rows_kernel(const floa
                                                                       const float* __restrict__ x,
                                                                       float* __restrict__ y, int n_in, int n_out,
                                                                       int rows) {
+    INK_PDL_WAIT();
     const int lane = threadIdx.x % WARP, o = blockIdx.x * GEMV_WARPS + threadIdx.x / WARP;
     if (o >= n_out) return;
     const float* wr = w + size_t(o) * n_in;
@@ -1961,6 +2190,7 @@ __device__ __forceinline__ void store_q4_lane(float x, int8_t* codes, uint16_t* 
 // inkling2 fork, --kv k8v4: rows of n values (a multiple of 32) to the 4-bit cache from row `pos`, a warp a block
 __global__ void store_q4_kernel(const float* __restrict__ x, int8_t* codes, uint16_t* scales, int n, long long pos,
                                 int rows, bool wht) {
+    INK_PDL_WAIT();
     const long long blk = (long long) blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     const int lane = threadIdx.x % WARP;
     if (blk >= (long long) rows * (n / 32)) return;   // a whole warp
@@ -1971,6 +2201,7 @@ __global__ void store_q4_kernel(const float* __restrict__ x, int8_t* codes, uint
 
 // inkling2 fork, --kv k8v4 (the tensor-core path): out's rows of 32 values turned back from the rotation in place
 __global__ void wht_back_kernel(float* out, long long blocks) {
+    INK_PDL_WAIT();
     const long long blk = (long long) blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     const int lane = threadIdx.x % WARP;
     if (blk >= blocks) return;
@@ -2037,6 +2268,7 @@ __device__ __forceinline__ void kv_store_head(const KvArgs& a, const Rows& rows,
 
 template <class Rows>
 __global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a, Rows rows) {
+    INK_PDL_WAIT();
     __shared__ float part[AT_DIM / WARP];
     kv_store_head(a, rows, blockIdx.x, blockIdx.y, part);
 }
@@ -2045,6 +2277,7 @@ __global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a, Rows rows) {
 // a block, in one launch: the same work, a block or a warp as each of the two would give it.
 template <class Rows, class From>
 __global__ void __launch_bounds__(AT_DIM) kv_clip_kernel(KvArgs a, Rows rows, ClipJobs c, int count, From from) {
+    INK_PDL_WAIT();
     __shared__ float part[AT_DIM / WARP];
     const int b = blockIdx.x, kv = 2 * a.kv_heads;
     if (b < kv) {
@@ -2344,6 +2577,57 @@ void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* c
         nr.eps = norm->eps;
     }
     const cudaStream_t st = cs(stream);
+    // inkling2 fork, INKLING2_MIX_CLUSTER=3 or 6 (opt-in): the same work over a cluster of that many blocks a mix
+    static const int cluster = [] {
+        const char* e = std::getenv("INKLING2_MIX_CLUSTER");
+        const int v = e ? std::atoi(e) : 0;
+        return v == 3 || v == 6 ? v : 0;
+    }();
+    const int warps4 = n / 4 / WARP;
+    static const bool clusters = [] {   // thread block clusters: compute capability 9.0 and newer
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
+    }();
+    if (cluster && clusters && (n / 4) % WARP == 0 && warps4 % cluster == 0) {
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(unsigned(count * cluster));
+        cfg.blockDim = dim3(unsigned(n / 4 / cluster));
+        cfg.stream = st;
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeClusterDimension;
+        at[0].val.clusterDim.x = unsigned(cluster), at[0].val.clusterDim.y = 1, at[0].val.clusterDim.z = 1;
+        cfg.attrs = at;
+        cfg.numAttrs = 1;
+        const auto go = [&](auto kernel) {
+            const cudaError_t e = cudaLaunchKernelEx(&cfg, kernel, mp, c, nr, n, eps);
+            if (e != cudaSuccess)
+                throw std::runtime_error(std::string("inkling_mix_conv (cluster): ") + cudaGetErrorString(e));
+        };
+        const int sum = norm ? norm->threads : 0;
+        if (cluster == 3) {
+            switch (sum) {
+                case 0: go(mix_conv_cl_kernel<0, 3>); break;
+                case 128: go(mix_conv_cl_kernel<128, 3>); break;
+                case 256: go(mix_conv_cl_kernel<256, 3>); break;
+                case 512: go(mix_conv_cl_kernel<512, 3>); break;
+                case 1024: go(mix_conv_cl_kernel<1024, 3>); break;
+                default: throw std::invalid_argument("inkling_mix_conv: norms of 128, 256, 512 or 1024 threads");
+            }
+        } else {
+            switch (sum) {
+                case 0: go(mix_conv_cl_kernel<0, 6>); break;
+                case 128: go(mix_conv_cl_kernel<128, 6>); break;
+                case 256: go(mix_conv_cl_kernel<256, 6>); break;
+                case 512: go(mix_conv_cl_kernel<512, 6>); break;
+                case 1024: go(mix_conv_cl_kernel<1024, 6>); break;
+                default: throw std::invalid_argument("inkling_mix_conv: norms of 128, 256, 512 or 1024 threads");
+            }
+        }
+        check_launch("inkling_mix_conv (cluster)");
+        return;
+    }
     switch (norm ? norm->threads : 0) {
         case 0: mix_conv_kernel<0><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
         case 128: mix_conv_kernel<128><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
@@ -2365,10 +2649,20 @@ void inkling_control(void* blas, const float* cur, const float* msg, const float
     float* f = g + size_t(rows) * n;
     rms_norm(cur, nullptr, z, n, rows, eps, stream, 2 * n);
     rms_norm(msg, nullptr, z + n, n, rows, eps, stream, 2 * n);
+    // inkling2 fork, INKLING2_CTRL_TC=1 (TF32) or 2 (BF16), opt-in: a prompt batch's three products on the tensor
+    // cores (gemm_f32_tc()), not the same bits
+    static const int tc = [] {
+        const char* v = std::getenv("INKLING2_CTRL_TC");
+        return v ? std::atoi(v) : 0;
+    }();
     if (rows < 8 || !blas) {
         gemv_f32(down, z, r, 2 * n, rank, rank, rows, stream);
         gemv_f32(gain, r, g, rank, n, n, rows, stream);
         gemv_f32(forget, r, f, rank, n, n, rows, stream);
+    } else if (tc == 1 || tc == 2) {
+        gemm_f32_tc(blas, down, z, r, 2 * n, rank, rows, tc);
+        gemm_f32_tc(blas, gain, r, g, rank, n, rows, tc);
+        gemm_f32_tc(blas, forget, r, f, rank, n, rows, tc);
     } else {
         gemm_f32(blas, down, z, r, 2 * n, rank, rank, rows);
         gemm_f32(blas, gain, r, g, rank, n, n, rows);
@@ -2584,11 +2878,13 @@ __device__ __forceinline__ unsigned long long global_ns() {
     return t;
 }
 __global__ void stamp_kernel(unsigned long long* ring, unsigned* idx, unsigned cap, int tag) {
+    INK_PDL_WAIT();
     const unsigned long long t = global_ns();
     const unsigned i = atomicAdd(idx, 1u);
     if (i < cap) ring[2 * (size_t) i] = (unsigned long long) tag, ring[2 * (size_t) i + 1] = t;
 }
 __global__ void clock_spin_kernel(volatile unsigned long long* mapped, long long ns) {
+    INK_PDL_WAIT();
     const unsigned long long t0 = global_ns();
     for (;;) {
         const unsigned long long t = global_ns();
@@ -2607,4 +2903,9 @@ void inkling_clock_spin(unsigned long long* mapped, long long ns, void* stream) 
     clock_spin_kernel<<<1, 1, 0, cs(stream)>>>(mapped, ns);
 }
 
+}  // namespace strata::poly
+
+// inkling2 fork, INKLING2_PDL_EARLY: this file's kernels' flag
+namespace strata::poly {
+void ink_pdl_early_inkling(int on) { cudaMemcpyToSymbol(ink_pdl_early_, &on, sizeof on); }
 }  // namespace strata::poly

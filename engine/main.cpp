@@ -60,6 +60,15 @@ using strata::poly::KvFmt;
 using strata::poly::Options;
 using Clock = std::chrono::steady_clock;
 
+// inkling2 fork, INKLING2_REQ_TIMES=1 (development): a request's steps on the host, in ms from the line's arrival
+Clock::time_point req_t0;
+void req_mark(const char* what) {
+    static const bool on = std::getenv("INKLING2_REQ_TIMES") != nullptr;
+    if (!on) return;
+    std::fprintf(stderr, "strata-inkling2: INKLING2_REQ_TIMES: %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(Clock::now() - req_t0).count(), what);
+}
+
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 // serve() saves the experts' use after its first answer and then after an answer when the last save is this long
@@ -334,6 +343,7 @@ public:
         cv_.wait(l, [this] { return !q_.empty(); });
         std::string s = std::move(q_.front());
         q_.pop_front();
+        popped();
         return s;
     }
     /// The next line when there is one.
@@ -342,6 +352,7 @@ public:
         if (q_.empty()) return false;
         s = std::move(q_.front());
         q_.pop_front();
+        popped();
         return true;
     }
     /// The lines waiting that start with `head`, out of the queue, the others left in their order.
@@ -352,6 +363,7 @@ public:
             if (it->rfind(head, 0) == 0) {
                 out.push_back(std::move(*it));
                 it = q_.erase(it);
+                ++popped_;
             } else {
                 ++it;
             }
@@ -366,15 +378,28 @@ private:
         std::string l;
         while (std::getline(std::cin, l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
-            if (l == "STOP") stop.store(true);
-            else push(l);
+            if (l == "STOP") {
+                std::lock_guard<std::mutex> g(m_);
+                stop_after_ = pushed_;
+                stop.store(true);
+            } else {
+                push(l);
+            }
         }
         push("QUIT");
     }
     void push(std::string s) {
-        { std::lock_guard<std::mutex> l(m_); q_.push_back(std::move(s)); }
+        { std::lock_guard<std::mutex> l(m_); q_.push_back(std::move(s)); ++pushed_; }
         cv_.notify_one();
     }
+    // inkling2 fork: a line leaves the queue (m_ held).  A STOP that came before the line was read from stdin is
+    // stale, the request it was for is over; one that came after it is for this line's request and stays.  (The
+    // loop cleared the flag after its pop: a STOP between the two was lost, and the request ran to its end.)
+    void popped() {
+        ++popped_;
+        if (stop.load() && stop_after_ < popped_) stop.store(false);
+    }
+    size_t pushed_ = 0, popped_ = 0, stop_after_ = 0;   // lines in, lines out, the lines in before the last STOP
 
     std::mutex m_;
     std::condition_variable cv_;
@@ -408,6 +433,33 @@ struct Session {
     strata::spec::SuffixDrafter repeats;
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
+    // inkling2 fork, INKLING2_LOOKUP_GATE=1 (opt-in): what the lookup's windows saved, by kind (0: a match shorter
+    // than kCopyMatch, 1: a copy), as the ms the tokens they wrote would have taken a step each less the window's
+    // own (EMA).  A kind that loses is shut for `shut` rounds, twice as long each time it loses again, and opened for
+    // one window after; one that pays starts over.  The steps of one token are timed all the time, so the price of a
+    // step follows the context's length.  It only chooses which drafts to verify: the output is unchanged.
+    struct LookupGate {
+        bool on = false;
+        double step_ms = 0.0;                       // a step of one token (EMA)
+        double saved[2] = {0.0, 0.0};               // ms a window saved (EMA)
+        int seen[2] = {0, 0};
+        long long round = 0, open_at[2] = {0, 0};   // the kind's windows are shut until round open_at
+        int shut[2] = {32, 32};
+        bool lets(int kind) const { return !on || round >= open_at[kind]; }
+        void step(double ms) { step_ms = step_ms > 0 ? 0.9 * step_ms + 0.1 * ms : ms; }
+        void window(int kind, int wrote, double ms) {
+            if (!on || step_ms <= 0) return;
+            const double s = wrote * step_ms - ms;
+            saved[kind] = seen[kind] > 0 ? 0.7 * saved[kind] + 0.3 * s : s;
+            if (++seen[kind] >= 3 && saved[kind] < 0) {
+                open_at[kind] = round + shut[kind];
+                shut[kind] = std::min(shut[kind] * 2, 1024);
+                seen[kind] = 2;   // the window that opens it again counts with what was before
+            } else if (saved[kind] > 0) {
+                shut[kind] = 32;
+            }
+        }
+    } gate;
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
     std::string pinned;                   // --pinned-session: the file serve() pins before its first request
 
@@ -415,7 +467,10 @@ struct Session {
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
           most(lookup > 0 || e.drafts() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
           look(lookup > 0 && most > 1),
-          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {}
+          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {
+        const char* g = std::getenv("INKLING2_LOOKUP_GATE");
+        gate.on = g != nullptr && std::atoi(g) != 0;
+    }
 
     static CacheOptions with_floor(const CacheFlags& f) {
         CacheOptions o = f.o;
@@ -449,11 +504,19 @@ struct Session {
                     int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
                     OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr) {
         Result r;
+        static const bool sync_check = [] {   // inkling2 fork, INKLING2_SYNC_CHECK=1: Engine::check_card()
+            const char* v = std::getenv("INKLING2_SYNC_CHECK");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         const bool look = this->look && !s.no_lookup;   // inkling2 fork: lookup=0 turns it off for this request
         const int64_t n = (int64_t) ids.size();
         Clock::time_point t0 = Clock::now(), shown = t0;   // bringing a parked conversation back is prompt time
+        engine.check_card("the request's start (the work of the one before)");   // INKLING2_SYNC_CHECK
+        req_mark("generate()");
         engine.images(pictures.at.data(), (int) pictures.at.size());
         r.resume = kept.resume(ids);
+        req_mark("resumed");
+        engine.check_card("after the conversation was brought back (resume)");
         if (const size_t freed = engine.trim_kv(n)) {
             const int had = engine.cached_experts();
             engine.mind_vram();
@@ -461,6 +524,7 @@ struct Session {
                                  "before do not reach; the expert cache %d -> %d experts\n",
                          double(freed) / double(1ull << 30), had, engine.cached_experts());
         }
+        req_mark("trim_kv");
         kept.turn_at(turn_at);
         kept.sys_at(s.sys_at);
         asked += n;
@@ -497,7 +561,9 @@ struct Session {
             const int64_t room = std::min<int64_t>({text ? text_run : n - 1 - i,
                                                     text ? engine.max_read() : engine.max_rows(), most});
             const int64_t m = last ? 1 : text ? room : engine.whole(i, kept.until_checkpoint(i, room));
+            req_mark(last ? "before the last token" : "before a piece");
             kept.before(i, last);
+            engine.check_card("before a piece of the prompt");
             if (text && !last) {
                 kept.inside(i, m, due);
                 marks.clear();
@@ -505,6 +571,11 @@ struct Session {
                 // A long prompt is one read.  Between its layers the read says how far it is, and a request that
                 // was stopped gives it up there: the conversation is then at its last checkpoint.
                 const std::function<bool(int, int)> turn = [&](int done, int of) {
+                    if (sync_check) {
+                        const std::string at = "a read of " + std::to_string(m) + " tokens from " + std::to_string(i) +
+                                               ", part " + std::to_string(done) + " of " + std::to_string(of);
+                        engine.check_card(at.c_str());
+                    }
                     if (stop.load()) return false;
                     if (ms_since(shown) >= 500.0) {
                         on_progress(i + m * done / of, n, ms_since(t0), false);
@@ -519,8 +590,11 @@ struct Session {
                 }
             } else {
                 if (last) engine.end_read();   // the last token, as the answer's, with the whole expert cache
+                if (last) req_mark("end_read() before the last token");
                 engine.eval(ids.data() + i, (int) m, last);
             }
+            engine.check_card(last ? "the prompt's last token" : text ? "a read, after its last part" : "an eval of the prompt");
+            req_mark("a piece read");
             kept.read(ids.data() + i, m);
             i += m;
             r.read += m;
@@ -535,6 +609,7 @@ struct Session {
             }
         }
         engine.end_read();
+        engine.check_card("after end_read (the buffers narrowed)");
         kept.prompt_was(n);
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
@@ -573,7 +648,9 @@ struct Session {
                 const int offered = look && room ? repeats.propose(most - 1, w + 1) : 0;
                 const int match = repeats.last_match();
                 const int widest = match >= kCopyMatch ? most : std::min(most, block_window);   // this round's window
-                const int k = std::min(offered, widest - 1);
+                const int kind = match >= kCopyMatch ? 1 : 0;
+                ++gate.round;
+                const int k = gate.lets(kind) ? std::min(offered, widest - 1) : 0;
                 // A repeat that fills the window, from a match of a length that has been right nine times in ten,
                 // is taken as it is: the block would mostly say the same, and asking it takes time.  Otherwise the
                 // block guesses, each guess from the one before, while a guess more pays (Guesses).
@@ -597,11 +674,13 @@ struct Session {
                 if (use.t == 1) {
                     const Clock::time_point step_at = Clock::now();
                     engine.eval(&t, 1, true);
+                    engine.check_card("a token of the answer");
                     kept.read(&t, 1);
                     const Clock::time_point pick_at = Clock::now();
                     t = pick(engine.logits());
                     r.alone_pick_ms += ms_since(pick_at);
                     ++r.alone, r.alone_ms += ms_since(step_at);
+                    gate.step(ms_since(step_at));
                     policy.observe(false, 1, 0, 0, count(1, 1));
                     continue;
                 }
@@ -609,6 +688,7 @@ struct Session {
                 if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
                 const Clock::time_point step_at = Clock::now();
                 engine.window(w, use.t);
+                engine.check_card("a window of the answer");
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
                 int right = 0;
@@ -621,6 +701,11 @@ struct Session {
                 r.guessed += use.t - 1;
                 r.guessed_right += right + (more ? 0 : 1);
                 policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
+                if (use.lookup) gate.window(kind, right + 1, ms_since(step_at));
+                static const bool trace = std::getenv("INKLING2_LOOKUP_TRACE") != nullptr;
+                if (trace)
+                    std::fprintf(stderr, "strata-inkling2: window at %lld: match %d, offered %d, t %d, right %d, %.1f ms\n",
+                                 (long long) engine.pos(), match, offered, use.t, right, ms_since(step_at));
                 if (!more) break;
             }
         }
@@ -1076,6 +1161,7 @@ int serve(Session& ss) {
             continue;
         }
         if (line == "QUIT") break;
+        req_t0 = Clock::now();
         if (line.empty()) continue;
         // BSTOP <slot>: the slot ends with its next token.  BYIELD: a long read gives way to a shorter one in the
         // other engine only; this one reads it to its end.
@@ -1085,7 +1171,7 @@ int serve(Session& ss) {
             continue;
         }
         if (line.rfind("BYIELD", 0) == 0) continue;
-        lines.stop.store(false);   // a STOP that came between requests is stale
+        // (a STOP that came between requests is stale: Lines::popped() has cleared it)
         // BGEN <slot> <max_new> ... reads the prompt and picks its first token as GEN 1 does, then the request goes
         // on in that slot (BADM <slot> 1), or ends there (BADM <slot> 0)
         admit = -1;
@@ -1208,6 +1294,7 @@ int serve(Session& ss) {
             continue;
         }
 
+        req_mark("the line parsed");
         const strata::poly::Stats before = engine.stats();
         int64_t resume = 0;
         Session::Result r;
@@ -1220,6 +1307,7 @@ int serve(Session& ss) {
             text = pictures.at.empty();
             ss.piece_calls = writing() ? 1 : kPiece;
             piece_t0 = Clock::now();
+            req_mark("bound");
             const int had = engine.cached_experts();
             if (engine.mind_vram())
                 std::fprintf(stderr, "strata-poly: the expert cache %d -> %d experts (%.2f GiB) for the VRAM free "

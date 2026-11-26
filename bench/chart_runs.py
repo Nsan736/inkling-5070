@@ -3,6 +3,7 @@
 
   v034  今の既定 (INKLING2_GPU_TOKEN / SLOT_ORDER / FAST_PICK がオン、窓 32)
   v032  0.3.2 と同じデコードの計算: その 3 つを =0、窓 8
+  v010  v0.1.0 のビルド (INKLING2_BUILD で指す)、当時の setup の設定
 
 依頼は dspark_probe.py の code (前置きの公開ソースコード + 新しいコードを書く依頼)。結果は bench/logs/chart_runs.jsonl。
 
@@ -25,7 +26,11 @@ OUT = B.ROOT / "bench" / "logs" / "chart_runs.jsonl"
 VERSIONS = {
     "v034": ({}, "32"),
     "v032": ({"INKLING2_GPU_TOKEN": "0", "INKLING2_SLOT_ORDER": "0", "INKLING2_FAST_PICK": "0"}, "8"),
+    # v0.1.0's own build (INKLING2_BUILD), with what its setup wrote for 12 GB / 32 GB: the window 8 and a max context
+    # of 132,096 whatever the prompt (the others: the prompt's length plus 1,024)
+    "v010": ({}, "8"),
 }
+FIXED_CONTEXT = {"v010": 132096}
 
 
 def main():
@@ -45,7 +50,7 @@ def main():
             for k, val in env.items():
                 os.environ[k] = val
             flags = list(B.BASE_FLAGS)
-            flags[flags.index("--max-context") + 1] = str(D.CTX[ctx] + 1024)
+            flags[flags.index("--max-context") + 1] = str(FIXED_CONTEXT.get(v, D.CTX[ctx] + 1024))
             flags[flags.index("--window") + 1] = window
             e = U.Engine([str(B.EXE), "--model", str(B.MODEL), "--serve"] + flags + ["--kv", "q8_0"], log="chart_runs.log")
             try:

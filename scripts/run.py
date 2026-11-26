@@ -92,6 +92,11 @@ def main():
     if a.api_key:
         cmd += ["--api-key", a.api_key]
     env = dict(os.environ)
+    # The server's and the engine's temporary files (an image's encoder files, a conversation moved out of VRAM)
+    # in this folder's tmp\, not in the user's %TEMP%
+    tmp = ROOT / "tmp"
+    tmp.mkdir(exist_ok=True)
+    env["TMP"] = env["TEMP"] = str(tmp)
     stop = threading.Event()
     if not a.quiet and cfg.get("log"):
         env["INKLING2_REPORT_CACHE"] = "1"   # the engine's line after each answer (its expert cache, its hit rate)

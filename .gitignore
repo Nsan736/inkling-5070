@@ -4,6 +4,10 @@ data/
 config/
 logs/
 .venv/
+# what run.bat and update.bat write
+tmp/
+old/
+update_tmp/
 # builds and packages
 build/
 build-*/

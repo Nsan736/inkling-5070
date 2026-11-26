@@ -59,6 +59,12 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
+    // inkling2 fork, INKLING2_LOOKUP_FIT=1 (opt-in): a window's cost kept as a multiple of the step of one token
+    // (rel_, EMA), priced at the one token's cost now, so the windows' prices follow the context's length with the
+    // steps that are measured all the time; a size not measured yet is scaled from the measured windows alone (not
+    // from the one token, whose step is a recording of its own and far cheaper), or before any from kFitFirst.
+    bool fit_ = false;
+    std::array<double, kMaxT + 1> rel_{};
 };
 
 }  // namespace strata::spec

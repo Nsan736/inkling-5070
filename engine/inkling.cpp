@@ -433,20 +433,31 @@ void Inkling::assign_scratch() {
 
 // ---- the streams in r_ -----------------------------------------------------------------------------------------
 
+// inkling2 fork, INKLING2_COPY_KERNEL=1 (opt-in): the streams' copies of several tokens in a kernel (copy_rows())
+static bool copy_kernel() {
+    static const bool on = [] {
+        const char* v = std::getenv("INKLING2_COPY_KERNEL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 void Inkling::gather(int k, float* dst, int n, int first) {
     const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * kStreams;
-    ck(cudaMemcpy2DAsync(dst, e, r_ + (size_t) first * kStreams * n_embd_ + (size_t) k * n_embd_, rs, e, (size_t) n,
-                         cudaMemcpyDeviceToDevice, cs(st_)),
-       "streams");
+    const float* src = r_ + (size_t) first * kStreams * n_embd_ + (size_t) k * n_embd_;
+    if (copy_kernel()) return copy_rows(dst, e, src, rs, e, (size_t) n, st_);
+    ck(cudaMemcpy2DAsync(dst, e, src, rs, e, (size_t) n, cudaMemcpyDeviceToDevice, cs(st_)), "streams");
 }
 
 void Inkling::scatter(int k, const float* src, int n) {
     const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * kStreams;
+    if (copy_kernel()) return copy_rows(stream(k), rs, src, e, e, (size_t) n, st_);
     ck(cudaMemcpy2DAsync(stream(k), rs, src, e, e, (size_t) n, cudaMemcpyDeviceToDevice, cs(st_)), "streams");
 }
 
 void Inkling::copy_stream(int from, int to, int n) {
     const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * kStreams;
+    if (copy_kernel()) return copy_rows(stream(to), rs, stream(from), rs, e, (size_t) n, st_);
     ck(cudaMemcpy2DAsync(stream(to), rs, stream(from), rs, e, (size_t) n, cudaMemcpyDeviceToDevice, cs(st_)),
        "streams");
 }
@@ -757,7 +768,8 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             bp[k] = stream(kBlock0 + k);
         } else {
             scatter(kBlock0 + k, res_, n);
-            ck(cudaMemcpyAsync(blk_[k], res_, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)), "streams");
+            if (copy_kernel()) copy_rows(blk_[k], e * sizeof(float), res_, e * sizeof(float), e * sizeof(float), 1, st_);
+            else ck(cudaMemcpyAsync(blk_[k], res_, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)), "streams");
             bp[k] = blk_[k];
         }
         post_conv(o_, post, B.post_conv, cres, n, true, rows_of_);
@@ -900,7 +912,7 @@ void Inkling::router_scores(const Layer& L, int n) {
 bool Inkling::route_card(int il, int n, int32_t* ids, float* w) {
     const Block& B = blocks_[(size_t) il];
     route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, B.probs_b_dev.p ? fp(B.probs_b_dev) : nullptr, nullptr, true,
-               w_scale_, ids, w, st_);
+               w_scale_, ids, w, st_, route_ids_too_, route_w_too_);
     return true;
 }
 

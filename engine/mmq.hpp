@@ -22,6 +22,8 @@ public:
     static bool fits(int ggml_type, int64_t w_rows, int64_t w_cols, bool q2_0 = false);
     /// Bytes of `rows` rows of `cols` values as quantize() writes them.
     static size_t q8_bytes(int64_t rows, int64_t cols);
+    /// quantize() writes Q8_1 rows for a matrix of ggml_type (not FP4 ones): situ_mmq() can write them instead.
+    static bool q8_1_rows(int ggml_type);
     /// quantize() keeps the rows' block sums in halves for a matrix of ggml_type (guard_half_sums()).
     static bool half_sums(int ggml_type);
     /// A row's product with a matrix of ggml_type is the same to the bit however the rows are split between
@@ -34,6 +36,12 @@ public:
     /// call whole.
     static void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld,
                          int64_t rows, void* stream);
+    /// inkling2 fork, INKLING2_QSCATTER: quantize()'s rows for the routed experts, each token's row quantized once:
+    /// row inv[t * n_used + k] of xq is token t's row of x (ld floats a row), for the k-th of its experts; inv -1:
+    /// that place has no row.  rows is xq's row count (quantize()'s rows).  The same bytes as quantize() with the
+    /// rows' token ids, at a token's cost where that was each of its experts'.
+    static void quantize_scatter(const float* x, const int32_t* inv, void* xq, int ggml_type, int64_t cols,
+                                 int64_t ld, int64_t tokens, int64_t rows, int n_used, void* stream);
     /// The scratch the products take at their first launch with a split of tiles (llama.cpp's stream-k fixup, at
     /// most a tile of floats a multiprocessor), taken now: it is VRAM a card that later has none to spare would
     /// fail to get (Inkling 2 at a long prompt after short ones).

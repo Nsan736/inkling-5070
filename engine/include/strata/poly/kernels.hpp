@@ -23,6 +23,9 @@ void gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out,
 /// for each group of rows_per_x outputs.  It sums in another order than gemv_f32, so a row does not come out
 /// to the last bit as it does there.  Throws std::runtime_error.
 void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows);
+/// inkling2 fork, INKLING2_CTRL_TC (opt-in): gemm_f32() of one group by cuBLAS on the tensor cores, the inputs
+/// rounded on the way: `mode` 1 TF32 (10 bits of mantissa), 2 BF16 (7 bits); the sums in F32.  Not the same bits.
+void gemm_f32_tc(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows, int mode);
 /// n BF16 values as floats, for gemm_f32.
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);
 /// Before a Q8_1 quantization whose blocks keep their sums in halves (llama.cpp's MMQ for Q4_K, Q5_K, Q2_K, Q4_1,
@@ -198,7 +201,8 @@ void expert_weights(float* w, const float* scale, const int32_t* ids, int rows, 
 /// is llama.cpp's SIGMOID_LOGIT_ADD, Kolibri 1's: the weights are sigmoid(scores) and the pick is scores + bias.
 /// Throws std::invalid_argument past 512 experts.
 void route_rows(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale, const float* bias,
-                const float* escale, bool norm, float w_scale, int32_t* ids, float* w, void* stream);
+                const float* escale, bool norm, float w_scale, int32_t* ids, float* w, void* stream,
+                int32_t* ids_too = nullptr, float* w_too = nullptr);   // inkling2 fork: the same also there (pinned)
 /// acc[t] += sum over k < n_used of w[t * n_used + k] * x[t * n_used + k], for rows of n values: a token's
 /// weighted experts added to its row.
 void moe_sum(const float* x, const float* w, float* acc, int n, int n_used, int rows, void* stream);
@@ -279,15 +283,26 @@ void bell_ring(int visit, const int32_t* ids, const void* const* table, int n_us
                unsigned* cur, int32_t* all_ids, void* stream);
 /// When *cur is not 0: waits for the host's ack of it, then acc[i] += x[i] (x pinned, n floats), as axpy() adds.
 void bell_wait_add(const unsigned* cur, TokenBell* bell, const float* x, float* acc, int n, void* stream);
-// inkling2 fork: moe_sum() of the picks whose table[ids] is set, the others left out
+// inkling2 fork: moe_sum() of the picks whose table[ids] is set, the others left out.  `scale`, when given, is
+// expert_weights()'s, applied here to each weight as it would have been (w * scale[id], then times x).  `store`:
+// acc = 0 + the sum, as zeroed acc and then the sum added (the zeroing left out)
 void card_part_sum(const float* x, const float* w, const int32_t* ids, const void* const* table, float* acc, int n,
-                   int n_used, int rows, void* stream);
+                   int n_used, int rows, void* stream, const float* scale = nullptr, bool store = false);
 /// acc = x * a, or acc += x * a when `add`.
 void axpy(const float* x, float a, float* acc, int n, bool add, void* stream);
 /// y = x for two runs of 4-byte words, n0 and n1 of them, in one launch.  Pinned host memory is the card's to read
 /// and write too, and a kernel's copy to or from it has none of the wait that a copy engine's has on Windows,
 /// some 25 microseconds between it and the launches beside it.
 void copy2(const void* x0, void* y0, int n0, const void* x1, void* y1, int n1, void* stream);
+/// inkling2 fork, INKLING2_SLOT_CHECK=1 (diagnostic): the picks ids[0..rr) of a call checked against the table before the
+/// experts' launches: an id out of [0, n_expert) or a slot outside [lo, hi) (null is fine) counts in out[0], and the
+/// first one leaves out[1] its row, out[2] its id, out[3..4] its slot (pinned memory, read after a sync)
+void slot_check(const int32_t* ids, const void* const* table, int rr, int n_expert, const void* lo, const void* hi,
+                unsigned* out, void* stream);
+/// inkling2 fork, INKLING2_COPY_KERNEL: rows of `width` bytes from src (rows `src_pitch` apart) to dst (`dst_pitch`
+/// apart), as cudaMemcpy2DAsync copies them, in a kernel (on WDDM a kernel is handed to the card sooner than a copy);
+/// the pitches, the width and the pointers multiples of 16 bytes
+void copy_rows(void* dst, size_t dst_pitch, const void* src, size_t src_pitch, size_t width, size_t rows, void* stream);
 /// inkling2 fork: *counter + 1 into *counter and into *host_flag (pinned), after the stream's work before it
 void signal_seq(unsigned* counter, unsigned* host_flag, void* stream);
 /// Up to 32 vectors of n values, each times its weight into its own sum, one after the other: acc[k] += x[k] * w[k]

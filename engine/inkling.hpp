@@ -64,6 +64,7 @@ protected:
     void output_rows(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
+    bool shared_is_zero() const override { return true; }
     void router_scores(const Layer& L, int n) override;
     void moe_shared(const Layer& L, int il, int n) override;
     /// A token's (fused()), outside a window of guesses: the same for every call of one token, so that a recording

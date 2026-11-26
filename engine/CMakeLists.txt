@@ -112,8 +112,14 @@ add_library(ink_mmq_fp4 OBJECT ${INK_MMQ}/template-instances/mmq-instance-mxfp4.
 set_target_properties(ink_mmq_fp4 PROPERTIES CUDA_ARCHITECTURES "${INK_FP4_ARCHS}")
 target_include_directories(ink_mmq_fp4 PRIVATE ${INK_GG}/include ${INK_GG}/src ${INK_MMQ})
 target_compile_options(ink_mmq_fp4 PRIVATE ${INK_CUDA_OPTS})
+# inkling2 fork, INKLING2_SITU_MMQ: SiTU into the MMQ Q8_1 rows (situ_mmq.cu).  -use_fast_math as ink_mmq's but for
+# its function mapping, so that the quantization is quantize.cu's to the bit and SiTU's tanhf/expf the engine's
+add_library(ink_situ_mmq OBJECT situ_mmq.cu)
+target_include_directories(ink_situ_mmq PRIVATE ${INK_GG}/include ${INK_GG}/src ${INK_MMQ} ${INK_INCLUDE})
+target_compile_options(ink_situ_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -ftz=true -prec-div=false
+                       -prec-sqrt=false>)
 add_library(ink_mmq STATIC mmq.cu fattn.cu mmq_nvfp4.cu base/prefill/ggml_cuda_host.cu ${INK_MMQ}/quantize.cu
-                           ${INK_MMQ_INSTANCES} $<TARGET_OBJECTS:ink_mmq_fp4>)
+                           ${INK_MMQ_INSTANCES} $<TARGET_OBJECTS:ink_mmq_fp4> $<TARGET_OBJECTS:ink_situ_mmq>)
 target_include_directories(ink_mmq PRIVATE ${INK_GG}/include ${INK_GG}/src ${INK_MMQ} ${INK_INCLUDE})
 target_compile_options(ink_mmq PRIVATE ${INK_CUDA_OPTS})
 target_compile_definitions(ink_mmq PRIVATE STRATA_POLY_NVFP4=1)

@@ -3,7 +3,10 @@
 The package holds bin\\ (strata-inkling2.exe, inkling2_logits_dump.exe, strata-vision.exe, the CUDA and C++ runtime DLLs they need),
 the server, the scripts, the docs and the licenses.  The model is not in it: setup.bat downloads it.
 
-  python tools/package.py [--version 0.3.4] [--build build]
+  python tools/package.py [--version 0.3.5] [--build build]
+
+Beside the zip it writes dist\SHA256SUMS.txt (the zip's SHA-256): every release carries it, and update.bat uses a
+download only if its SHA-256 is the one there.
 
 Redistributed runtime files:
   cublas64_13.dll, cublasLt64_13.dll   NVIDIA CUDA Toolkit, redistributable under the CUDA EULA's Attachment A
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import os
 import shutil
 import subprocess
@@ -26,7 +30,7 @@ EXES = ("strata-inkling2.exe", "inkling2_logits_dump.exe")
 CUDA_DLLS = ("cublas64_13.dll", "cublasLt64_13.dll")
 CRT_DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll",
             "vcruntime140_1.dll")
-TREE = ("server", "scripts", "docs", "setup.bat", "run.bat", "requirements.txt", "README.md", "README.en.md", "LICENSE",
+TREE = ("server", "scripts", "docs", "setup.bat", "run.bat", "update.bat", "requirements.txt", "README.md", "README.en.md", "LICENSE",
         "NOTICE", "UPSTREAM.md")
 
 
@@ -51,7 +55,7 @@ def crt_dir():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", default="0.3.4")
+    ap.add_argument("--version", default="0.3.5")
     ap.add_argument("--build", default=str(ROOT / "build"))
     a = ap.parse_args()
     bin_src = Path(a.build) / "bin"
@@ -83,6 +87,7 @@ def main():
             shutil.copytree(src, stage / t, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         elif src.exists():
             shutil.copy2(src, stage / t)
+    (stage / "VERSION").write_text(a.version + "\n", encoding="ascii")   # update.bat compares it with the newest release
     eula = Path(os.environ.get("CUDA_PATH", "")) / "EULA.txt"
     lic = stage / "licenses"
     lic.mkdir()
@@ -97,7 +102,12 @@ def main():
         for p in sorted(stage.rglob("*")):
             if p.is_file():
                 z.write(p, Path(name) / p.relative_to(stage))
-    print(f"{zpath} ({zpath.stat().st_size / 2**20:.0f} MiB)")
+    h = hashlib.sha256()
+    with zpath.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    (ROOT / "dist" / "SHA256SUMS.txt").write_text(f"{h.hexdigest()}  {zpath.name}\n", encoding="ascii")
+    print(f"{zpath} ({zpath.stat().st_size / 2**20:.0f} MiB), SHA-256 {h.hexdigest()} (dist\\SHA256SUMS.txt)")
     return 0
 
 

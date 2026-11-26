@@ -2,6 +2,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -23,11 +24,18 @@ constexpr int kProbes = 3;       // a lookup window size is tried this often bef
 // A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
 // one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
 constexpr double kStaleRounds = 300.0;
+// inkling2 fork, INKLING2_LOOKUP_FIT: before any window is measured, a window of t costs this many times the shape
+// says (2 tokens: 2.0 one-token steps).  Measured, RTX 5070: a window of 2-3 tokens 54 ms against a token's 18 ms
+// at 128K (the one token runs as one recording, a window does not)
+constexpr double kFitFirst = 1.5;
 
 }  // namespace
 
 DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
+    const char* e = std::getenv("INKLING2_LOOKUP_FIT");
+    fit_ = e != nullptr && std::atoi(e) != 0;
+}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -40,6 +48,17 @@ double DraftPolicy::lookup_rate(int match) const {
 
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
+    if (fit_ && t > 1 && cost_n_[1] > 0) {
+        if (cost_n_[t] > 0) return rel_[t] * cost_[1];
+        double num = 0.0, den = 0.0;
+        for (int u = 2; u <= kMaxT; ++u)
+            if (cost_n_[u] > 0) {
+                const double w = std::min(cost_n_[u], 20.0);
+                num += w * rel_[u] * shape(t) / shape(u);
+                den += w;
+            }
+        return (den > 0 ? num / den : kFitFirst * shape(t)) * cost_[1];
+    }
     if (cost_n_[t] > 0) return cost_[t];
     // scale from the measured sizes, weighting each by how often it was seen
     double num = 0.0, den = 0.0;
@@ -92,6 +111,10 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
+    if (fit_ && round_ms > 0 && t > 1 && cost_n_[1] > 0) {
+        const double r = round_ms / cost_[1];
+        rel_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * rel_[t] + kCostAlpha * r : r;
+    }
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;

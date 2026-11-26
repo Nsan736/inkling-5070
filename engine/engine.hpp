@@ -306,7 +306,7 @@ public:
     void unfreeze_experts();
     void refreeze_experts();
     /// The most tokens one eval() takes.
-    int max_rows() const { return rows_; }
+    int max_rows() const { return rows_wide_ ? rows_wide_ : rows_; }   // inkling2 fork: INKLING2_NARROW_WRITE
     /// Feed n tokens from position pos().  With want_logits, logits() then holds the scores of the token after the
     /// last one.
     void eval(const int32_t* tokens, int n, bool want_logits);
@@ -333,6 +333,11 @@ public:
               const std::function<bool(int, int)>* turn = nullptr);
     /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib lent the staging
     /// buffer.  window() and step() do it too, if the caller has not.
+    /// inkling2 fork, INKLING2_SYNC_CHECK=1 (opt-in, development): every stream's work done, and the card's error
+    /// if it has one, thrown as "<where>: ..."; a no-op without the setting.  An illegal memory access is reported
+    /// by the first wait after it, so the waits are put where the work's parts end (a read's layers, a token).
+    void check_card(const char* where);
+    static bool sync_check_on();
     void end_read() {
         if (stage_lent_) narrow_stage();
         if (scratch_lent_) narrow_scratch();
@@ -354,7 +359,16 @@ public:
     /// What a kept token computed is what eval() would have computed for it.
     int max_window() const { return opt_.window; }
     void window(const int32_t* tokens, int t);
-    const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
+    const float* logits_of(int i) {
+        if (next_) return next_->logits_of(i);
+        if (i >= wl_have_ && i < wl_rows_) fetch_logits(i);   // inkling2 fork, INKLING2_LAZY_LOGITS
+        return h_wlogits_ + (size_t) i * n_vocab_;
+    }
+    /// inkling2 fork, INKLING2_LAZY_LOGITS=1 (opt-in): a window's rows of logits on the host so far (wl_have_ of
+    /// wl_rows_); the rest come when logits_of() asks for one, twice as many each time
+    void fetch_logits(int i);
+    int wl_rows_ = 0, wl_have_ = 0;
+    bool wl_spoiled_ = false;   ///< wlogits_ was written again (a draft head's rows) with rows of the window not copied
     void keep(int n);
 
     /// Some files carry a block that guesses ahead: one layer that takes a token and the model's output for the
@@ -519,6 +533,8 @@ protected:
     }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
+    /// inkling2 fork: moe_shared() only zeroes the sum (no shared expert), so a first store may stand in for it
+    virtual bool shared_is_zero() const { return false; }
     /// moe_card() of n tokens leaves the experts' sum to the layer's tail: d_ holds each picked expert's output and
     /// d_wts_ its weight, and run() sets card_parts_ for the tail that follows.
     virtual bool card_sum_in_tail(int n) const { (void) n; return false; }
@@ -735,10 +751,18 @@ protected:
     int grow_cache(size_t bytes, bool later = false);
     void fill_now();
     void widen_stage();
+    // inkling2 fork, INKLING2_LOOP_FIRST=N (opt-in): a read of N tokens or more takes the loop's experts that VRAM
+    // lacks into the slots of the least used experts of the other layers (of the same size) and puts those back
+    // when it is done, so the cache an answer finds is the one it had (loop_first()).
+    struct LoopMove {
+        int in_il, in_e, out_il, out_e;
+    };
+    std::vector<LoopMove> loop_moved_;
+    void loop_first(bool on);
     // inkling2 fork, INKLING2_WIDE_READ=N (opt-in): scratch_ laid out for N rows while writing, for the prompt batch
     // (rows_wide_) while reading, its VRAM in between lent by the expert cache (widen_scratch() / narrow_scratch())
     void carve_scratch(int rows);
-    void widen_scratch();
+    void widen_scratch(int rows = 0);   ///< INKLING2_NARROW_WRITE: rows, 0 the prompt batch's
     void narrow_scratch();
     void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
@@ -833,6 +857,8 @@ protected:
     bool gelu_ = false;       ///< the routed experts' activation: GELU of the gate, else SiLU within the layer's limits
     std::optional<Situ> situ_;   ///< in place of both, Inkling 2's SiTU (cpu_experts.hpp)
     /// The routed experts' activation of `rows` rows of n_ff_exp_ gate values then n_ff_exp_ up values, into h.
+    void qscatter_check(const void* xq, int type, int n, int rg);
+    bool situ_mmq_rows(const float* gate_up, float* h, int rows, float limit, const ExpertScales* es, int dt);
     void act_rows(const float* gate_up, float* h, int rows, float limit, const ExpertScales* es);
     /// alloc(): MMQ's scratch taken before the expert cache is filled (Mmq::reserve_fixup()); Inkling 2's, else off
     bool reserve_mmq_ = false;
@@ -966,6 +992,7 @@ protected:
     int way_calls_[65] = {};     ///< windows of each size since the way behind had one
     int way_backoff_[65] = {};   ///< the way behind waits kWayAgain << this many windows of the size
     bool halves_ = false;        ///< the way of the window under way
+    int32_t *d_inv_ = nullptr, *h_inv_ = nullptr;   ///< INKLING2_QSCATTER: each place's row of the card's (-1: none)
     float *wlogits_ = nullptr, *h_wlogits_ = nullptr;   ///< a window's logits, token after token: VRAM and pinned
     int cached_ = 0;
 
@@ -1207,6 +1234,9 @@ protected:
     // pinned); this thread computes them (moe()) and acks, and the card waits for that in a kernel.  A visit with
     // all its picks in VRAM does not wait for the host at all.
     bool gpu_token_now_ = false;        ///< split_ok() for the recording's layers
+    int32_t* route_ids_too_ = nullptr;  ///< INKLING2_FUSE=2: route_card() also writes its picks and weights here
+    float* route_w_too_ = nullptr;
+    bool part_store_ = false;           ///< INKLING2_FUSE=2: moe_split_launch()'s sum stores into fo_ (no zeroing before)
     bool bell_capture_ = false;         ///< moe_split_launch() records no event
     bool bell_mode_ = false;            ///< moe() finds the picks on the host already
     void* bell_ = nullptr;              ///< TokenBell, pinned

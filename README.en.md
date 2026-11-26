@@ -6,11 +6,11 @@
 > [PolyStrata](https://github.com/simplexai-labs/PolyStrata); it is not part of either project and is not supported
 > by their authors.
 
-> **Status (0.3.4)**
-> - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0053, top-1 agreement 97.7% at a 2K
->   context; mean KLD 0.0081, top-1 96.7% at a 128K context.
-> - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0030, top-1 98.0% (0.3.2: 0.0026 / 98.4%, which 0.3.4 gives
->   again with its three changes set to 0).
+> **Status (0.3.5)**
+> - The default IQ4_XS against llama.cpp's logits (IQ4_XS, fp16 KV): mean KLD 0.0051, top-1 agreement 97.5% at a 2K
+>   context; mean KLD 0.0079, top-1 97.0% at a 128K context (0.3.4: 0.0053 / 97.7%, 0.0081 / 96.7%).
+> - Against Unsloth's Q8_K_XL (llama.cpp) at 2K: mean KLD 0.0027, top-1 98.4% (0.3.4: 0.0030 / 98.0%).
+> - The release zip, unpacked into an empty folder, set up and started, held a 30-turn conversation through the server.
 > - The smaller models (Q3_K_XL / Q2_K_XL / IQ2_XXS) were checked at 2K only.
 > - Pictures: a photo, a screenshot and a chart were described correctly (no benchmark).
 > - Tested on one PC only (RTX 5070 / Windows 11). The 8 GB and 6 GB figures were measured on that RTX 5070 with its
@@ -100,15 +100,15 @@ tok/s (IQ2_XXS).
 
 ## Speed on that PC (IQ4_XS, 12 GB)
 
-One request; 200 tokens after the first 16. This engine's temperature-1.0 writing and its 128K read are 0.3.4, after one warm-up answer on the same prompt; the greedy rows, the 8K read and NInfer are 0.3.1's. 128K writing: after a 128K code context.
+One request; 200 tokens after the first 16. This engine's 8K and 128K temperature-1.0 writing are 0.3.5, after one warm-up answer on the same prompt, without lookup (128K with lookup: 65.9 tok/s); its 128K read is 0.3.4's; the greedy rows, the 8K read and NInfer are 0.3.1's. 128K writing: after a 128K code context.
 
 | | This engine | NInfer 2026-11-22.2 (Windows) |
 |---|---|---|
-| 8K, temperature 1.0 | 84.7 tok/s | 49.7 tok/s |
+| 8K, temperature 1.0 | 91.3 tok/s | 49.7 tok/s |
 | 8K, greedy | 68.9 tok/s | 51.5 tok/s |
 | 8K, greedy + lookup drafting | 69.7 tok/s | |
 | 8K prompt | 2,247 tok/s (0.3.1; 0.3.2: 2,565 at 4K, 2,475 at 32K) | 2,171 tok/s |
-| 128K, temperature 1.0 | 51.2 tok/s | 26.2 tok/s |
+| 128K, temperature 1.0 | 61.3 tok/s | 26.2 tok/s |
 | 128K, greedy | 42.9 tok/s | 26.3 tok/s |
 | 128K prompt (whole context) | 1,978 tok/s | 663 tok/s |
 | CPU while writing | 7-8 cores | ~10 cores |
@@ -134,6 +134,55 @@ One request; 200 tokens after the first 16. This engine's temperature-1.0 writin
   - Window 32 places slightly different experts in VRAM than window 8, so the output may not match it exactly (the
     same kind of variation that happens between starts at the default).
 - More: [docs/measurements.md](docs/measurements.md)
+
+### What changed in 0.3.5 (on by default; `=0` turns each off)
+
+Ten changes, most of them a token's small kernels done as fewer, are on by default.
+
+| Change | Off |
+|---|---|
+| The experts' weight scales applied in the sum of the card's part | `INKLING2_FUSE=0` |
+| The mixing step over a cluster of 6 blocks | `INKLING2_MIX_CLUSTER=0` |
+| In a token's CUDA graph, a kernel launched while the one before it ends (PDL) | `INKLING2_PDL=0` |
+| The same, the next kernel launched once every block of the one before runs | `INKLING2_PDL_EARLY=0` |
+| The same, a kernel's weights asked into L2 while it waits | `INKLING2_PDL_PREFETCH=0` |
+| While writing, the scratch holds 256 rows and the expert cache takes the rest (a read widens it) | `INKLING2_NARROW_WRITE=0` |
+| A window's (the checked guesses') attention with its tokens side by side | `INKLING2_ATTN_TOKEN_FAST=0` |
+| The streams' row copies by a kernel | `INKLING2_COPY_KERNEL=0` |
+| A window's logits copied to the host only as far as they are used | `INKLING2_LAZY_LOGITS=0` |
+| A window's (up to 32 tokens) experts routed on the card too | `INKLING2_CARD_SPLIT=0` |
+
+Measured (0.3.4's defaults -> the nine of them other than CARD_SPLIT, window 32, temperature 1.0):
+
+| | 0.3.4 | 0.3.5 | Change |
+|---|---|---|---|
+| 8K writing, no lookup (2 runs each) | 82.4 / 82.6 | 90.4 / 92.2 | +10.7% |
+| 100K writing, no lookup (2 runs each) | 60.0 / 59.9 | 65.3 / 66.4 | +9.9% |
+| 128K writing, no lookup (mean of 4) | 53.5 | 61.3 | +14.8% |
+| 128K writing, lookup (mean of 4) | 54.0 | 65.9 | +22% |
+| 128K read | 2,044 / 2,060 | 2,009 / 2,014 | -1.9% |
+| 64K edit requests fix / code / blocks (1 run each) | 94.2 / 91.5 / 77.2 | 95.2 / 101.6 / 88.2 | +1% / +11% / +14% |
+| 100K edit requests fix / code / blocks | 79.8 / 81.9 / 64.3 | 87.1 / 89.1 / 74.6 | +9% / +9% / +16% |
+
+- **CARD_SPLIT=2:** edit requests that copy the conversation's text write faster still.
+  - +2-9% at 64K, +2-8% at 100K.
+  - Measured with the others on, against `INKLING2_CARD_SPLIT=1` (windows of up to 4 tokens routed on the card), 2 runs
+    each, alternating.
+- **Output:** the model is the same. The sums' order and the experts' places change, so the output is not exactly 0.3.4's;
+  the quality is the Status above (about 0.3.4's).
+- **Reads:** NARROW_WRITE widens the scratch for each read: a long read is about 2% slower (+30-60 ms a short read).
+- **Fixed in 0.3.5** (each could happen with these changes on):
+  - After a read, the scratch was narrowed while a copy on the card still read the VRAM it gave back (a rare illegal memory
+    access).
+  - During a read, a stale table pointed at expert slots that had been given back (an illegal memory access with CARD_SPLIT).
+  - A STOP that came just after the next request was taken could be lost.
+  - When widening the scratch failed, the expert cache stayed smaller.
+  - LAZY_LOGITS: a window's logits overwritten before they were copied are an error now, not silently used.
+- **Not in (still opt-in):**
+  - Prompt-read kernels: `INKLING2_QSCATTER=1`, `INKLING2_SITU_MMQ=1`, `INKLING2_CTRL_TC=1` (the loop control on TF32),
+    `STRATA_PREFILL_NVFP4=w4a4` (experts as FP4 x FP4; changes the output). Their gains were within the run-to-run noise
+    (about 8%).
+  - `INKLING2_GPU_WINDOW` (a window as one CUDA graph too) still has a bug.
 
 ### What changed in 0.3.4 (on by default; an environment variable turns each off)
 
@@ -235,6 +284,45 @@ A request that sends no thinking level thinks at `medium` (`setup.bat --thinking
 Settings setup chooses by usable VRAM: 128K context / 2,048-token prompt batches from 12 GB (256K with
 `--context 256k`: 1,024), 64K / 1,024 from 10 GB, 32K / 1,024 from 8 GB, 16K / 512 below; experts in RAM = RAM - 14 GB
 (max 9 GB); up to 12 CPU threads.
+
+### Updating (`update.bat`, from 0.3.5)
+
+1. Stop the server (close `run.bat`'s window, or Ctrl+C). While it runs, update.bat changes nothing.
+2. Run `update.bat`.
+   - It asks GitHub for [the newest release of Nsan736/inkling-5070](https://github.com/Nsan736/inkling-5070/releases/latest)
+     and downloads its zip if it is newer. It downloads from this repository's releases only.
+   - The zip's SHA-256 must be the one in the release's `SHA256SUMS.txt`; otherwise it stops with nothing changed.
+   - Only the program is replaced (`bin\`, `server\`, `scripts\`, `docs\`, the bat files, the READMEs, ...). The model
+     (`models\`), the settings (`config\`), `.venv`, the logs (`logs\`) and the tokenizer (`data\`) stay.
+   - Settings a new version adds go into `config\inkling.json` with your values kept, and are shown (the old file is
+     `config\inkling.json.before-update`).
+   - A version whose Python packages changed updates `.venv`.
+   - The program as it was goes to `old\<version>\`.
+- `update.bat --check` only says whether a newer release is out.
+- **Going back:** `update.bat --rollback` puts back the newest version in `old\` (the current program goes to
+  `old\<version>.replaced\`).
+  - By hand: stop the server, delete `bin\`, `server\`, `scripts\`, `docs\`, `licenses\`, the bat files and the READMEs
+    in the folder, and move what is in `old\<version>\` into it.
+- 0.3.4 and before have no `update.bat`. Copy `update.bat` and `scripts\update.ps1` from the 0.3.5 zip to the same places
+  in your folder, then run it to update from 0.3.4.
+
+## Privacy (what 0.3.5's code was read for)
+
+- **Listening:** `run.bat` starts the server on `127.0.0.1` (this PC only).
+  - Other devices reach it only if you pass a host yourself, e.g. `run.bat --host 0.0.0.0` (then add `--api-key`).
+  - The engine opens no network socket.
+- **Outbound:** the engine, the server and the chat page connect to nothing outside (the page's scripts and fonts are
+  local). The exceptions:
+  - `setup.bat`: Python packages (PyPI), the model and the image encoder's weights (Hugging Face).
+  - `update.bat`: GitHub's newest release, to check and to download.
+  - A request that holds an image URL (`http(s)://`): the server fetches that image.
+  - An MCP server you add in the settings: the connection to it.
+- **Logs:** `logs\engine.log` gets numbers only (tokens read, speed, the sampling values); no request or answer text.
+  Only with `STRATA_DEBUG=1` does the console show part of a request and the answer.
+- **Where files go:** the settings, the logs and the record of reused conversation prefixes (token ids) go inside the
+  unpacked folder (`config\`, `logs\`). A picture's temporary files and the like go to the folder's `tmp\`, where
+  `run.bat` points them (0.3.4 and before: the user's `%TEMP%`).
+- **Browser:** the chat page keeps its conversation and the API key in the browser's localStorage; mind that on a shared PC.
 
 ## Known limits
 

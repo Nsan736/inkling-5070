@@ -51,6 +51,26 @@
 #include <cstdio>
 #include <vector>
 
+// inkling2 fork, INKLING2_PDL: a kernel waits here for the grids before it to be done when it was launched as a
+// programmatic dependent (Engine::record()); otherwise the instruction returns at once
+// INKLING2_PDL_EARLY=1: the grids after it may start as soon as every block of this one has
+static __constant__ int ink_pdl_early_;
+// INKLING2_PDL_PREFETCH=1: the projections' kernels ask L2 for their weight rows before they wait (the weights are
+// no grid's output), so that a launch that starts early reads them while the kernel before it runs
+static __constant__ int ink_pdl_prefetch_;
+__device__ __forceinline__ void prefetch_rows(const void* p, size_t bytes) {
+    if (!ink_pdl_prefetch_) return;
+    const char* c = static_cast<const char*>(p);
+    const int tid = int(threadIdx.y * blockDim.x + threadIdx.x), nt = int(blockDim.x * blockDim.y);
+    for (size_t o = size_t(tid) * 128; o < bytes; o += size_t(nt) * 128)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(c + o));
+}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define INK_PDL_WAIT() do { asm volatile("griddepcontrol.wait;" ::: "memory"); if (ink_pdl_early_) asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); } while (0)
+#else
+#define INK_PDL_WAIT() ((void) 0)
+#endif
+
 namespace strata::kernels {
 namespace {
 
@@ -168,6 +188,7 @@ __device__ __forceinline__ float warp_max(float x) {
 
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_quantize_q8_1_kernel(const float* x_, Q81Block* y_, int n_in) {
+    INK_PDL_WAIT();
     const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     Q81Block* STRATA_PDL_RESTRICT y = y_;
     pdl_trigger();   // PDL (pdl.hpp): the projection after this one may start loading its weights
@@ -187,6 +208,7 @@ __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
                                                    const float* __restrict__ up,
                                                    Q81Block* __restrict__ y, int n_in) {
+    INK_PDL_WAIT();
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float gi = gate[i];
@@ -240,6 +262,7 @@ __launch_bounds__(1024, 1)
 __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
                                                 const float* __restrict__ w, float* __restrict__ y,
                                                 Q81Block* __restrict__ yq, int n, float eps) {
+    INK_PDL_WAIT();
     add_rms_norm_q8_1_row<SUM>(x + std::size_t(blockIdx.x) * n, add ? add + std::size_t(blockIdx.x) * n : nullptr, w,
                                y + std::size_t(blockIdx.x) * n, yq + std::size_t(blockIdx.x) * (n / Q8K), n, eps);
 }
@@ -248,6 +271,7 @@ __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const flo
 template<int SUM>
 __launch_bounds__(1024, 1)
 __global__ void native_rms_norm_q8_1_rows_kernel(NormRows r, int n, float eps) {
+    INK_PDL_WAIT();
     const int k = blockIdx.x;
     add_rms_norm_q8_1_row<SUM>(const_cast<float*>(r.x[k]), nullptr, r.w[k], r.y[k],
                                static_cast<Q81Block*>(r.y_q8_1[k]), n, eps);
@@ -323,6 +347,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -391,6 +416,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 2;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -479,6 +505,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q3_k_mmvq_kernel(const Q3KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 16;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -542,6 +569,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q2_k_mmvq_kernel(const Q2KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 16;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -652,6 +680,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
                                          const Q81Block* __restrict__ x,
                                          float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 4 * WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -747,6 +776,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -822,6 +852,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -949,6 +980,12 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
                                          const Q81Block* __restrict__ x,
                                          float* __restrict__ y, int n_in, int n_out) {
+    {
+        constexpr int R = SmallK ? WARPS : 1;
+        const int r0 = R * int(blockIdx.x), rows = min(R, n_out - r0);
+        if (rows > 0) prefetch_rows(w + std::size_t(r0) * (n_in / 32), std::size_t(rows) * (n_in / 32) * sizeof(Weight));
+    }
+    INK_PDL_WAIT();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -1370,6 +1407,7 @@ __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
                                          int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
+    INK_PDL_WAIT();
     const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
@@ -1606,6 +1644,7 @@ template<typename F, int NCOLS, int ROWS>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
                                     float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     using XB = B6X<F>;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
@@ -1722,6 +1761,7 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
 template<typename F, int ROWS, typename S>
 __launch_bounds__(WARPS * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_slots_kernel(S slots, int n_in, int n_out) {
+    INK_PDL_WAIT();
     const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
     if (!at.w) return;   // the whole block: before any barrier
     const auto* w = static_cast<const typename F::Block*>(at.w);
@@ -1766,6 +1806,7 @@ __global__ void native_mmvq_slots_kernel(S slots, int n_in, int n_out) {
 template<typename F, int ROWS, typename S, int G = 1>
 __launch_bounds__(WARPS * WARP)
 __global__ void native_mmvq_slots_warp_kernel(S slots, int n_in, int n_out) {
+    INK_PDL_WAIT();
     if (!slot_ptrs(slots, int(blockIdx.y)).w) return;
     // G row groups a warp, WARP / G lanes each (G = 2 when a row needs 16 lanes or fewer: the IQ4_XS down projection's
     // 512 values are 16): the full warp_sum's steps between the groups added the zeros of the lanes that had none of
@@ -1818,6 +1859,7 @@ __global__ void native_mmvq_slots_warp_kernel(S slots, int n_in, int n_out) {
 template<typename F, typename S>
 __launch_bounds__(WARPS * WARP)
 __global__ void native_mmvq_slots_lanes_kernel(S slots, int n_in, int n_out) {
+    INK_PDL_WAIT();
     const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
     if (!at.w) return;
     const int row = int(blockIdx.x) * WARPS + int(threadIdx.y);
@@ -2015,6 +2057,7 @@ template <typename I, int NC, int R>
 __launch_bounds__(4 * WARP)
 __global__ void native_mmvq_il_kernel(const typename I::F::Block* __restrict__ w, const int* __restrict__ xq,
                                       const float* __restrict__ xd, float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     using F = typename I::F;
     constexpr int SUB = WARP / F::T;   // weight blocks a chunk covers
     const int lane = int(threadIdx.x) & (WARP - 1);
@@ -2096,6 +2139,7 @@ void launch_il_rows(int r, const void* weights, const void* x_il, float* y, int 
 // quantizer, a fused norm): the same bytes, one int of a block a thread.
 __global__ void native_q8_1_interleave_kernel(const Q81Block* __restrict__ y, int* __restrict__ bm, int* __restrict__ pm,
                                               float* __restrict__ dl, int nb, int n_total, int cp) {
+    INK_PDL_WAIT();
     const int i = int(blockIdx.x) * 256 + int(threadIdx.x);
     if (i >= n_total) return;
     const int c = i / (nb * 8), r = i - c * nb * 8, b = r / 8, p = r % 8;
@@ -2111,6 +2155,7 @@ __global__ void native_q8_1_interleave_kernel(const Q81Block* __restrict__ y, in
 __global__ void native_quantize_q8_1_il_kernel(const float* __restrict__ x, Q81Block* __restrict__ y,
                                                int* __restrict__ bm, int* __restrict__ pm, float* __restrict__ dl,
                                                int n_in, int n_total, int cp) {
+    INK_PDL_WAIT();
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_total) return;   // n_total is a multiple of 32: only whole warps return
     const float xi = x[i];
@@ -2168,6 +2213,7 @@ template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     constexpr int BPIW = 64 / F::T;
     static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
     const int lane = int(threadIdx.x) & 63;
@@ -2295,6 +2341,7 @@ __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q8_0_packed_kernel(const int8_t* __restrict__ qs, const half* __restrict__ dpl,
                                           const Q81Block* __restrict__ x, float* __restrict__ y,
                                           int n_in, int n_out, int row_step) {
+    INK_PDL_WAIT();
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int nb = n_in / 32;
     const int kqs = 2 * (tid % 4);
@@ -2420,6 +2467,7 @@ __global__ void native_q6_k_packed_kernel(const int* __restrict__ ql, const int*
                                           const int8_t* __restrict__ sc, const half* __restrict__ dpl,
                                           const Q81Block* __restrict__ x, float* __restrict__ y,
                                           int n_in, int n_out, int row_step) {
+    INK_PDL_WAIT();
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int nb = n_in / 256;
     const int x_stride = n_in / Q8K;
@@ -2832,6 +2880,7 @@ template <int NCOLS>
 __global__ void __launch_bounds__(WARPS * WARP) q2_0_warp_rows_kernel(const Q20Block* __restrict__ w,
                                                                       const Q81Block* __restrict__ x,
                                                                       float* __restrict__ y, int n_in, int n_out) {
+    INK_PDL_WAIT();
     using F = Q20Traits;
     constexpr int RPW = kQ20WarpRows;
     static_assert(F::T == 2 && F::BPI == WARPS * WARP / 2, "the lanes play the exact layout's threads");
@@ -3408,6 +3457,14 @@ template<typename F, int NCOLS, int ROWS>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_mmvq_jobs_kernel(JobsArgs a, int n_in) {
     const int b = int(blockIdx.x);
+    {
+        const int k = job_of(a.first, a.count, b), row0 = ROWS * (b - a.first[k]);
+        const int rows = min(ROWS, a.j.n_out[k] - row0), bpr = n_in / F::DIV;
+        if (rows > 0)
+            prefetch_rows(static_cast<const typename F::Block*>(a.j.w[k]) + std::size_t(row0) * bpr,
+                          std::size_t(rows) * bpr * sizeof(typename F::Block));
+    }
+    INK_PDL_WAIT();
     mmvq_job_block<F, NCOLS, ROWS>(a, job_of(a.first, a.count, b), b, n_in);
 }
 
@@ -3419,6 +3476,7 @@ struct MixedArgs {
 };
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_mmvq_jobs_mixed_kernel(MixedArgs m, int n_in) {
+    INK_PDL_WAIT();
     const int b = int(blockIdx.x), k = job_of(m.a.first, m.a.count, b);
     switch (m.kind[k]) {
     case 0: mmvq_job_block<SmallTraits<Q80Block, 8>, 1, 1>(m.a, k, b, n_in); break;
@@ -3838,3 +3896,9 @@ void native_mmvq_il_tune(int) {}
 #endif  // !__HIPCC__
 
 } // namespace strata::kernels
+
+// inkling2 fork, INKLING2_PDL_EARLY: this file's kernels' flag
+namespace strata::poly {
+void ink_pdl_early_mmvq(int on) { cudaMemcpyToSymbol(ink_pdl_early_, &on, sizeof on); }
+void ink_pdl_prefetch_mmvq(int on) { cudaMemcpyToSymbol(ink_pdl_prefetch_, &on, sizeof on); }
+}  // namespace strata::poly

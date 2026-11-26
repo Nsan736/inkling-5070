@@ -25,6 +25,16 @@
 #include <cstdlib>
 #include <type_traits>
 
+// inkling2 fork, INKLING2_PDL: a kernel waits here for the grids before it to be done when it was launched as a
+// programmatic dependent (Engine::record()); otherwise the instruction returns at once
+// INKLING2_PDL_EARLY=1: the grids after it may start as soon as every block of this one has
+static __constant__ int ink_pdl_early_;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define INK_PDL_WAIT() do { asm volatile("griddepcontrol.wait;" ::: "memory"); if (ink_pdl_early_) asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); } while (0)
+#else
+#define INK_PDL_WAIT() ((void) 0)
+#endif
+
 namespace strata::kernels {
 namespace {
 
@@ -705,6 +715,7 @@ template<int TY>
 __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                    const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in,
                                                    int n_out, int ncols) {
+    INK_PDL_WAIT();
     const int row = blockIdx.x * 4 + threadIdx.y;
     if (row >= n_out) return;
     const int lane = threadIdx.x;
@@ -1413,6 +1424,7 @@ template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>, bool EXACT_N = fals
 __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                          const block_q8_1* __restrict__ x, float* __restrict__ y,
                                                          int n_in, int n_out, int ncols) {
+    INK_PDL_WAIT();
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
     const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
     const int row = blockIdx.x * 4 + threadIdx.y;
@@ -1460,6 +1472,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
                                                         const int32_t* __restrict__ ent_tok,
                                                         const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                         float* __restrict__ gate, float* __restrict__ up) {
+    INK_PDL_WAIT();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
     if (row >= 2 * L.n_ff) return;
@@ -1498,6 +1511,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               float* __restrict__ gate, float* __restrict__ up) {
+    INK_PDL_WAIT();
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TG, STAGE_GRID>::value);
@@ -1586,6 +1600,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
 
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                       long long n) {
+    INK_PDL_WAIT();
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
@@ -1599,6 +1614,7 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
                                                           const int32_t* __restrict__ ent_dst,
                                                           const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                           float* __restrict__ out) {
+    INK_PDL_WAIT();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = blockIdx.x * 8 + warp;
     if (r >= L.n_embd) return;
@@ -1633,6 +1649,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                                                 const int32_t* __restrict__ ent_dst,
                                                                 const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                                 float* __restrict__ out) {
+    INK_PDL_WAIT();
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
@@ -1914,6 +1931,7 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(const unsigned lon
                                                                             const int32_t* __restrict__ ent_tok,
                                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                                             float* __restrict__ gate, float* __restrict__ up, int rb) {
+    INK_PDL_WAIT();
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_XB];
@@ -2099,6 +2117,7 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
                                                                               const int32_t* __restrict__ ent_dst,
                                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                                               float* __restrict__ out, int rb) {
+    INK_PDL_WAIT();
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     constexpr int LANES = TD == 20 ? 8 : 16;
@@ -2164,6 +2183,7 @@ __device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restric
 }
 
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
+    INK_PDL_WAIT();
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     q8_1_store(x[i], y, i);
@@ -2181,6 +2201,7 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
                                                                   block_q8_1* __restrict__ hq) {
+    INK_PDL_WAIT();
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
@@ -2565,6 +2586,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
 template<typename dst_t>
 __global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y,
                                     const float* __restrict__ scale) {
+    INK_PDL_WAIT();
     const int64_t i = blockIdx.x;
     dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x);
     if (scale != nullptr) {       // NVFP4 down: s_down (the weights stay in FP16's normal range)
@@ -2579,6 +2601,7 @@ __global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* 
 // gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
 __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
                                   __half* __restrict__ y, const float* __restrict__ tail) {
+    INK_PDL_WAIT();
     const int64_t i = blockIdx.x;
     const int parity = blockIdx.y;
     const int64_t r = i / per_row, c = i % per_row;
@@ -2791,6 +2814,7 @@ __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long*
                                                        const int32_t* __restrict__ ent_tok,
                                                        const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                        float* __restrict__ gate, float* __restrict__ up) {
+    INK_PDL_WAIT();
     __shared__ uint32_t s_grid[LT ? 512 : 1];
     __shared__ block_q8_1 s_x[LX ? GRP_NC * S26_XMAX : 1];
     const int g = blockIdx.y;
@@ -2886,6 +2910,7 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
                                                          const int32_t* __restrict__ ent_dst,
                                                          const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                          float* __restrict__ out) {
+    INK_PDL_WAIT();
     __shared__ block_q8_1 s_h[LX ? GRP_NC * S26_HMAX : 1];
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
@@ -2993,6 +3018,7 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
 // contraction off so the product cannot fuse into the first sum); h is still written (it is the scratch the old pair used)
 __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                        block_q8_1* __restrict__ y, long long n) {
+    INK_PDL_WAIT();
 #pragma clang fp contract(off)
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n is a multiple of 32: whole warps only
@@ -3160,6 +3186,7 @@ __global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* _
                                                      const int32_t* __restrict__ ent_tok,
                                                      const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                      float* __restrict__ gate, float* __restrict__ up) {
+    INK_PDL_WAIT();
     using F = Fmt<TG>;
     using S = S27<TG>;
     __shared__ block_q8_1 s_x[LX ? GRP_NC * S26_XMAX : 1];
@@ -3251,6 +3278,7 @@ __global__ void __launch_bounds__(256) s27_down_kernel(const unsigned long long*
                                                        const int32_t* __restrict__ ent_dst,
                                                        const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                        float* __restrict__ out) {
+    INK_PDL_WAIT();
     using F = Fmt<TD>;
     using S = S27<TD>;
     __shared__ block_q8_1 s_h[LX ? GRP_NC * S26_HMAX : 1];
@@ -3572,6 +3600,7 @@ namespace {
 // mmvq_kernel for one column, with the matrix, its column and its output taken from blockIdx.y's slot.
 template<int TY, typename S>
 __global__ void __launch_bounds__(128) mmvq_slots_kernel(S slots, size_t row_bytes, int n_in, int n_out) {
+    INK_PDL_WAIT();
     const int row = blockIdx.x * 4 + threadIdx.y;
     if (row >= n_out) return;
     const int lane = threadIdx.x;
@@ -3588,6 +3617,7 @@ __global__ void __launch_bounds__(128) mmvq_slots_kernel(S slots, size_t row_byt
 constexpr int LANE_ROWS = 8;
 template<int TY, typename S>
 __global__ void __launch_bounds__(128) mmvq_slots_staged_kernel(S slots, size_t row_bytes, int n_in, int n_out) {
+    INK_PDL_WAIT();
     if (!slot_ptrs(slots, int(blockIdx.y)).w) return;   // the whole block: before the grid's barrier
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, true>::value);
     const uint32_t* s_grid = stage_iq_grid<TY, true>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
@@ -3645,6 +3675,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
 namespace {
 __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, size_t row_bytes,
                                   const int32_t* __restrict__ tokens, int64_t n_embd, float* __restrict__ y) {
+    INK_PDL_WAIT();
     const int t = blockIdx.y;
     const int64_t b = blockIdx.x;
     const uint8_t* row = table + (size_t) tokens[t] * row_bytes;
@@ -3787,6 +3818,7 @@ __global__ void __launch_bounds__(256) native_gu_amd_kernel(const unsigned long 
                                                             const int32_t* __restrict__ ent_tok,
                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                             float* __restrict__ gate, float* __restrict__ up) {
+    INK_PDL_WAIT();
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
@@ -3844,6 +3876,7 @@ __global__ void __launch_bounds__(256) native_down_amd_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_dst,
                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                               float* __restrict__ out) {
+    INK_PDL_WAIT();
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
@@ -4056,6 +4089,7 @@ __global__ void __launch_bounds__(256) native_gu_lds_kernel(const unsigned long 
                                                             const int32_t* __restrict__ ent_tok,
                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                             float* __restrict__ gate, float* __restrict__ up) {
+    INK_PDL_WAIT();
     using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
     __shared__ GT sgrid[GridOf<TG>::N];
@@ -4151,6 +4185,7 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_dst,
                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                               float* __restrict__ out) {
+    INK_PDL_WAIT();
     using F = Fmt<TD>;
     extern __shared__ int sh_raw[];   // LDS_NT entries x hb blocks of q8_1
     const int g = blockIdx.y;
@@ -4221,6 +4256,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               block_q8_1* __restrict__ hq) {
+    INK_PDL_WAIT();
     using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
     __shared__ GT sgrid[GridOf<TG>::N];
@@ -4597,3 +4633,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 }
 
 }  // namespace strata::kernels
+
+// inkling2 fork, INKLING2_PDL_EARLY: this file's kernels' flag
+namespace strata::poly {
+void ink_pdl_early_iq(int on) { cudaMemcpyToSymbol(ink_pdl_early_, &on, sizeof on); }
+}  // namespace strata::poly

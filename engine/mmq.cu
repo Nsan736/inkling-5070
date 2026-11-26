@@ -6,6 +6,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -124,6 +125,12 @@ bool Mmq::split_exact(int type, int64_t w_rows) {
     return true;
 }
 
+bool Mmq::q8_1_rows(int type) {
+    const ggml_type t = (ggml_type) type;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return !((t == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) || (t == GGML_TYPE_NVFP4 && nvfp4_fp4(cc)));
+}
+
 void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64_t cols, int64_t ld, int64_t rows,
                    void* stream) {
     if (rows <= 0) return;
@@ -141,6 +148,23 @@ void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64
                                (cudaStream_t) stream);
     }
     ck("mmq quantize");
+}
+
+void Mmq::quantize_scatter(const float* x, const int32_t* inv, void* xq, int type, int64_t cols, int64_t ld,
+                           int64_t tokens, int64_t rows, int n_used, void* stream) {
+    if (rows <= 0 || tokens <= 0) return;
+    const ggml_type t = (ggml_type) type;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool nv = t == GGML_TYPE_NVFP4 && nvfp4_fp4(cc);
+    if ((t == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) || nv) {
+        const bool aligned = (uintptr_t) x % 32 == 0 && ((size_t) ld * sizeof(float)) % 32 == 0;
+        quantize_scatter_mmq_fp4_cuda(x, inv, xq, nv ? fp4_scales(xq, rows, cols) : nullptr, t, aligned, cols, ld,
+                                      pad512(cols), tokens, rows, n_used, (cudaStream_t) stream);
+    } else {
+        quantize_scatter_mmq_q8_1_cuda(x, inv, xq, t, cols, ld, pad512(cols), tokens, rows, n_used,
+                                       (cudaStream_t) stream);
+    }
+    ck("mmq quantize (scatter)");
 }
 
 void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,
@@ -169,6 +193,14 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
     a.nsamples_y = 1;
     a.ncols_max = max_rows;
     a.ncols_opt = max_rows;
+    // inkling2 fork, INKLING2_MMQ_J=J (opt-in, a multiple of 8 up to 128): the tile width in the rows' direction is
+    // at most J (mul_mat_q_switch_J takes the narrowest of the fewest tiles for ncols_opt, so J itself when the rows
+    // are more); stream-k shares a tile's sums out by the tiles, so the sums' order may change with it
+    static const int64_t j_cap = [] {
+        const char* v = std::getenv("INKLING2_MMQ_J");
+        return v != nullptr ? (int64_t) std::atoi(v) : (int64_t) 0;
+    }();
+    if (j_cap >= 8 && j_cap <= 128 && j_cap % 8 == 0) a.ncols_opt = std::min<int64_t>(max_rows, j_cap);
 
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
